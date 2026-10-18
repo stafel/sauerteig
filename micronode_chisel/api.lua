@@ -23,7 +23,7 @@ function M.api_chisel(pos, base_material)
 	local node = core.get_node(pos)
 	local material = base_material or node.name
 
-	if not is_chiselable(pos) and not base_material then
+	if not M.is_chiselable(pos) and not base_material then
 		return false
 	end
 

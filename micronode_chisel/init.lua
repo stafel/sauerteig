@@ -19,6 +19,7 @@ dofile(core.get_modpath("micronode_chisel") .. "/render.lua")
 dofile(core.get_modpath("micronode_chisel") .. "/collision.lua")
 dofile(core.get_modpath("micronode_chisel") .. "/chisel.lua")
 dofile(core.get_modpath("micronode_chisel") .. "/api.lua")
+dofile(core.get_modpath("micronode_chisel") .. "/entities.lua")
 dofile(core.get_modpath("micronode_chisel") .. "/test.lua")
 
 -- Mod info

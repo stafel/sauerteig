@@ -40,6 +40,7 @@ local function is_chiselable(pos)
 	end
 	return false
 end
+M.is_chiselable = is_chiselable
 
 -- Check if a node is a micronode block
 function M.is_micronode_block(pos)
@@ -86,38 +87,8 @@ function M.chisel_block(pos, player_name)
 	return true
 end
 
--- Update the visual mesh of a micronode block
-function M.update_block_mesh(pos)
-	local meta = core.get_meta(pos)
-	local data_str = meta:get_string(M.META_KEY_DATA)
-	if data_str == "" then return end
-
-	local block_data = M.deserialize_block_data({
-		data = data_str,
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	-- Generate nodeboxes
-	local nodeboxes = M.get_nodebox_list(block_data.grid, block_data.palette)
-
-	-- Update the node definition dynamically
-	-- Note: This is a simplified approach. In production, we'd use a node with
-	-- dynamic nodeboxes via after_place_node or similar
-
-	-- For now, we store the nodebox data in metadata and use a custom on_activate
-	meta:set_string("mn_nodeboxes", core.serialize(nodeboxes))
-
-	-- Force mesh update
-	core.after(0, function()
-		core.after(0.1, function()
-			-- Trigger block update by modifying and restoring
-			local node = core.get_node(pos)
-			core.swap_node(pos, node)
-		end)
-	end)
-end
+-- update_block_mesh is implemented in entities.lua (entity-based rendering),
+-- which is loaded after this file and overrides any earlier definition.
 
 -- Edit micronodes: add or remove voxels
 function M.edit_micronodes(pos, mx, my, mz, grid_size, material_idx, add)
@@ -301,8 +272,15 @@ core.register_tool("micronode_chisel:chisel", {
 			return
 		end
 
-		-- Micronode block: add voxels
-		if st.chisel_mode and st.target_pos and vector.equals(st.target_pos, pos) then
+		-- Micronode block: activate edit mode on first click, then add voxels
+		if not (st.chisel_mode and st.target_pos and vector.equals(st.target_pos, pos)) then
+			st.chisel_mode = true
+			st.target_pos = pos
+			core.chat_send_player(name, "Editing block at " .. core.pos_to_string(pos)
+				.. " — left: add, right: remove, sneak+left: grid size")
+			return
+		end
+		do -- add voxels
 			-- Calculate micronode position from pointed position
 			local above = pointed_thing.above
 			local dir = vector.subtract(above, pos)
@@ -363,10 +341,19 @@ core.register_tool("micronode_chisel:chisel", {
 			return
 		end
 
-		-- Remove voxels from micronode block
-		if M.is_micronode_block(pos) and st.chisel_mode and st.target_pos
-			and vector.equals(st.target_pos, pos) then
-			local above = pointed_thing.above
+		-- Remove voxels from micronode block (activate mode on first click)
+		if M.is_micronode_block(pos) then
+			if not (st.chisel_mode and st.target_pos and vector.equals(st.target_pos, pos)) then
+				st.chisel_mode = true
+				st.target_pos = pos
+				core.chat_send_player(name, "Editing block at " .. core.pos_to_string(pos)
+					.. " — left: add, right: remove, sneak+left: grid size")
+				return
+			end
+		else
+			return
+		end
+		local above = pointed_thing.above
 			local dir = vector.subtract(above, pos)
 
 			local mx, my, mz = 8, 8, 8
@@ -401,7 +388,6 @@ core.register_tool("micronode_chisel:chisel", {
 			core.chat_send_player(name, string.format(
 				"Removed micronodes (fill: %.1f%%)",
 				info and info.fill_percent or 0))
-		end
 	end,
 
 	on_secondary_use = function(itemstack, user, pointed_thing)
@@ -446,14 +432,18 @@ core.register_node("micronode_chisel:chiseled_block", {
 	groups = {cracky = 3, chiseled = 1, not_in_creative_inventory = 1},
 	sounds = {},
 
-	-- Nodebox will be set dynamically based on micronode data
-	-- For now, use a placeholder
+	-- The container node itself is invisible: geometry is rendered by
+	-- static entities (see entities.lua). It stays pointable via the
+	-- selection box and solid via the collision box (v1 simplified AABB).
 	node_box = {
 		type = "fixed",
-		fixed = {{-0.5, -0.5, -0.5, 0.5, 0.5, 0.5}},
+		fixed = {},
 	},
 
-	-- Collision box (simplified)
+	selection_box = {
+		type = "regular",
+	},
+
 	collision_box = {
 		type = "regular",
 	},
@@ -481,7 +471,7 @@ core.register_node("micronode_chisel:chiseled_block", {
 
 	-- Drop as item with metadata
 	on_destruct = function(pos)
-		-- Could drop a "chiseled block" item with saved data
+		M.remove_block_entities(pos)
 	end,
 
 	-- Digging drops the base material

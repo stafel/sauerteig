@@ -358,6 +358,65 @@ local function test_storage_sizes()
 end
 
 ------------------------------------------------------------------------------
+-- Test 10: Entity rendering (end-to-end visual path)
+------------------------------------------------------------------------------
+
+local function test_entity_rendering()
+	local pos = vector.new(0, 40, 0)
+	core.load_area(pos)
+
+	-- Place a solid stone node
+	local stone = M.fallback_material or M.get_fallback_material()
+	core.set_node(pos, {name = stone})
+
+	-- Chisel it programmatically
+	if not M.api_chisel(pos, stone) then
+		log_test("entity_render", false, "api_chisel failed")
+		return false
+	end
+
+	-- Carve a chunk out to make it partial (triggers entity rendering)
+	local ok = M.api_fill_box(pos, 1, 1, 1, 16, 16, 8, "air")
+	if not ok then
+		log_test("entity_render", false, "api_fill_box failed")
+		return false
+	end
+
+	-- Count render entities around the block
+	local center = vector.add(pos, vector.new(0.5, 0.5, 0.5))
+	local count = 0
+	for _, obj in ipairs(core.get_objects_inside_radius(center, 1.3)) do
+		local lua = obj:get_luaentity()
+		if lua and lua.name == "micronode_chisel:box" then
+			count = count + 1
+		end
+	end
+
+	local pass = count >= 1
+	log_test("entity_render", pass,
+		string.format("Partial block spawned %d render entity/entities (expected >= 1)", count))
+
+	-- Fully carve: entities should be gone (grid empty -> nothing rendered)
+	M.api_fill_box(pos, 1, 1, 1, 16, 16, 16, "air")
+	count = 0
+	for _, obj in ipairs(core.get_objects_inside_radius(center, 1.3)) do
+		local lua = obj:get_luaentity()
+		if lua and lua.name == "micronode_chisel:box" then
+			count = count + 1
+		end
+	end
+
+	pass = pass and (count == 0)
+	log_test("entity_cleanup", pass,
+		string.format("Fully-carved block has %d entities (expected 0)", count))
+
+	-- Restore the area
+	core.set_node(pos, {name = stone})
+
+	return pass
+end
+
+------------------------------------------------------------------------------
 -- Run All Tests
 ------------------------------------------------------------------------------
 
@@ -375,6 +434,7 @@ local function run_all_tests()
 	test_block_data_serialization()
 	test_performance()
 	test_storage_sizes()
+	test_entity_rendering()
 
 	-- Summary
 	print("[micronode_chisel] ========================================")
