@@ -4,7 +4,7 @@
 
 local M = micronode_chisel
 
-M.API_VERSION = "2.0"
+M.API_VERSION = "2.1"
 
 -------------------------------------------------------------------------------
 -- Block operations
@@ -98,6 +98,36 @@ end
 
 function M.api_flip(pos)
 	return M.flip_block(pos)
+end
+
+-------------------------------------------------------------------------------
+-- Collision and clipboard
+-------------------------------------------------------------------------------
+
+-- Collision approximation of a chiseled block:
+-- {shape, node, boxes, iou, recall, fill, recognised} or nil.
+function M.api_collision(pos)
+	local block = M.get_block(pos)
+	if not block then
+		return nil
+	end
+	return M.collision_profile(block.grid)
+end
+
+-- Copy the block at `pos` into a clipboard owned by `owner` (any string, so a
+-- mod can keep its own blueprint). Returns ok, message.
+function M.api_copy(pos, owner)
+	return M.copy_block(owner or "@api", pos)
+end
+
+-- Paste `owner`'s clipboard at `pos`. opts: rotate (quarter turns), flip,
+-- player (name used for protection checks and undo, defaults to `owner`).
+function M.api_paste(pos, owner, opts)
+	opts = opts or {}
+	if not opts.player then
+		opts.player = owner or "@api"
+	end
+	return M.paste_block(owner or "@api", pos, opts)
 end
 
 -------------------------------------------------------------------------------

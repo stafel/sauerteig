@@ -9,7 +9,9 @@ then executes tools/qc_checks.lua, which drives the actual implementations:
     culling, per-material splits, hash signature)
   * render-budget coarsening
   * voxel DDA picking and brush regions
-  * collision variant selection
+  * collision shape recognition (slabs, stairs, panels, posts, fallbacks) and
+    the node variants that carry it
+  * clipboard copy/paste, rotation and undo
   * the full render path: chiselling, carving, entity spawn positions/sizes and
     texture crops (this is what catches the "disconnected faces" class of bug)
   * dig/drop wiring
@@ -34,6 +36,7 @@ MOD_FILES = [
     "edit.lua",
     "entities.lua",
     "render.lua",
+    "clipboard.lua",
     "chisel.lua",
     "api.lua",
 ]

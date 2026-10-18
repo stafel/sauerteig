@@ -34,8 +34,11 @@ function M.offset(pos, axis, dir)
 	return out
 end
 
+-- Every container type (one per collision shape, see collision.lua) counts as
+-- a chiseled block; M.CONTAINER_NODES is built there so this stays a single
+-- table lookup instead of an ever-growing comparison.
 function M.is_container_name(name)
-	return name == M.BLOCK_NODE or name == M.BLOCK_NODE_OPEN
+	return M.CONTAINER_NODES[name] == true
 end
 
 -- A node whose whole volume is opaque geometry: safe to cull faces against.
@@ -306,6 +309,38 @@ local function commit_undo(player_name, entry)
 	while #stack > M.UNDO_DEPTH do
 		table.remove(stack, 1)
 	end
+end
+
+-- Explicit undo entries for operations that replace a whole block (paste).
+-- Snapshots MUST be taken before the block is modified, so callers open an
+-- entry, record the affected positions, mutate, then commit it.
+function M.begin_undo_entry()
+	return begin_undo()
+end
+
+function M.add_undo_position(entry, pos)
+	if entry then
+		record_undo(entry, pos)
+	end
+	return entry
+end
+
+function M.commit_undo_entry(player_name, entry)
+	commit_undo(player_name, entry)
+end
+
+-- Convenience for callers that only need "restore these positions": snapshots
+-- the current state immediately. Do not call it after the mutation.
+function M.commit_positions_undo(player_name, positions)
+	if not player_name or not positions then
+		return 0
+	end
+	local entry = begin_undo()
+	for _, pos in ipairs(positions) do
+		record_undo(entry, pos)
+	end
+	commit_undo(player_name, entry)
+	return #entry.blocks
 end
 
 -- Undo the player's most recent edit. Returns success and the number of
@@ -644,9 +679,9 @@ function M.raycast_block(block, player, pos)
 	return M.raycast_grid(block.grid, pos, M.eye_pos(player), dir, R)
 end
 
--- The chiseled block the player is looking at, or nil. Used by commands; the
--- tool itself uses pointed_thing.under plus M.raycast_block.
-function M.get_pointed_block(player, range)
+-- The node the player is looking at (any type), or nil. Needed by commands that
+-- accept plain nodes, e.g. pasting onto a solid node to convert it.
+function M.get_pointed_node(player, range)
 	if not core.raycast then
 		return nil
 	end
@@ -662,8 +697,18 @@ function M.get_pointed_block(player, range)
 		z = eye.z + dir.z * range,
 	}
 	local hit = core.raycast(eye, target, false, false):next()
-	if hit and hit.type == "node" and M.is_micronode_block(hit.under) then
+	if hit and hit.type == "node" then
 		return hit.under
+	end
+	return nil
+end
+
+-- The chiseled block the player is looking at, or nil. Used by commands; the
+-- tool itself uses pointed_thing.under plus M.raycast_block.
+function M.get_pointed_block(player, range)
+	local pos = M.get_pointed_node(player, range)
+	if pos and M.is_micronode_block(pos) then
+		return pos
 	end
 	return nil
 end
@@ -773,6 +818,7 @@ function M.get_block_info(pos)
 	end
 	local solid = M.count_solid(block.grid)
 	local ratio, stored = M.get_compression_ratio(block.grid)
+	local collision = M.collision_profile(block.grid)
 	return {
 		base = block.base,
 		palette = block.palette,
@@ -781,6 +827,11 @@ function M.get_block_info(pos)
 		fill_percent = (#block.grid > 0) and (solid / #block.grid * 100) or 0,
 		compression_ratio = ratio,
 		stored_bytes = stored,
+		collision_shape = collision.shape,
+		collision_boxes = collision.boxes,
+		collision_recognised = collision.recognised,
+		collision_iou = collision.iou,
+		collision_node = collision.node,
 	}
 end
 

@@ -1,8 +1,8 @@
 # Micronode Chisel — Engineering Findings
 
-Read this before touching the renderer, picker, or entity code. Everything in
-§1 and §3 is ground truth taken from the engine sources in this repository
-(`luanti/src/...`), not from observation.
+Read this before touching the renderer, picker, collision, or entity code.
+Everything in §1 and §3 is ground truth taken from the engine sources in this
+repository (`luanti/src/...`), not from observation.
 
 ---
 
@@ -82,12 +82,13 @@ Sauerbraten's editing feel comes from three properties, replicated here:
 | File | Responsibility |
 |---|---|
 | `data.lua` | 16³ grid, palette, versioned RLE storage, transforms, textures |
-| `collision.lua` | solid vs walk-through container variant, fill ratio |
+| `collision.lua` | collision shape catalogue and recognition, container variant selection |
 | `mesh.lua` | exposed-surface extraction, greedy merging, box hash |
 | `edit.lua` | block access, DDA picking, brushes, region application, undo |
 | `entities.lua` | render entity lifecycle (cube visual, centered transform) |
 | `render.lua` | face texture crops, per-block rebuild, mapblock LBM |
-| `chisel.lua` | container nodes, chisel tool, per-player size/material state, size menu, chat commands |
+| `clipboard.lua` | blueprint copy/paste (compressed payload, rotation, undo) |
+| `chisel.lua` | container nodes, chisel tool, per-player size/material state, menus, chat commands |
 | `api.lua` | public API for other mods |
 
 ### Coordinate spaces
@@ -106,6 +107,81 @@ Grid indexing is the other classic trap: `M.get_voxel`/`M.set_voxel` take an
 explicit `res` and the mesher/boundary masks pass theirs. A coarsened grid has
 a different stride, and `M.count_solid` is nil-safe because short grids have
 nil cells that `v ~= 0` would count as solid.
+
+### Collision: shape recognition, not "solid or not"
+
+In Luanti, `walkable` and `collision_box` belong to a node **type**, not to a
+placed node, so per-micronode collision cannot be expressed on one container
+node. The engine does support **several boxes per type**: `NodeBox::fixed` is a
+`std::vector<aabb3f>` and `MapNode::getCollisionBoxes` (`mapnode.cpp:432`)
+emits all of them (falling back to `node_box` only when `fixed` is empty), and
+`collision.cpp:add_area_node_boxes` adds every box of every walkable node. A
+staircase variant made of two boxes is therefore real engine collision, not a
+hack.
+
+Consequence: one container node type per recognised shape. `collision.lua`
+holds the catalogue and picks the variant:
+
+1. **Occupancy** is sampled on an 8³ grid (1/8 node = 12.5 cm). A collision
+   cell is solid when **any** of its 2³ micronodes is solid. "Any" is
+   deliberate: conservative collision means a chiselled floor never lets the
+   player fall through, costing at most one collision cell of invisible bulk.
+2. **Scoring** is intersection-over-union over each catalogue shape's own cell
+   list (≤ 512 lookups), with a cheap `min/max` bound skipping candidates whose
+   cell count is incompatible before any lookup.
+3. A candidate is accepted only when `iou >= COLLISION_MIN_IOU` **and**
+   `recall >= COLLISION_MIN_RECALL` (share of solid geometry covered), so a bad
+   match can never turn a floor into a hole.
+4. No acceptable match → a **safe fallback**. Geometry that reaches the node
+   floor becomes a bottom slab up to its topmost occupied layer (and geometry
+   hanging from the ceiling becomes the mirrored top slab). A slab is
+   full-footprint, so recall is 1 by construction: an unrecognised floor or
+   platform is standable instead of walk-through. Geometry floating mid-node
+   keeps the legacy rule (`>= 50 % solid` → full cube, else no collision),
+   because boxing in a carved alcove is worse than a passable decoration.
+
+The catalogue is deliberately a fixed set of rudimentary forms rather than an
+arbitrary box decomposition: full/empty, bottom and top slabs at 1/8 steps
+(1/16-precision geometry snaps to the nearest), stairs in 4 orientations plus
+their inverted (ceiling) forms, walls/panels of 1/8, 1/4 and 1/2 thickness
+against a side, mid-node walls, and corner/centred posts. 45 shapes, i.e. 45
+registered container types (`micronode_chisel:shape_*`, plus the two historical
+names for `full` and `empty` so old worlds need no migration).
+
+Rules to preserve:
+
+- `full` and `empty` keep the historical node names (`chiseled_block`,
+  `chiseled_block_open`). Never rename them: they are in saved worlds.
+- The empty/variant selection must keep working for *any* container name:
+  classify through `M.CONTAINER_NODES`, never by comparing to two names.
+- Collision-only changes must not touch metadata or geometry; the swap is a
+  `core.swap_node`, which keeps metadata and skips callbacks.
+- The collision LBM in `render.lua` re-picks the variant on mapblock load, so a
+  changed catalogue applies to existing worlds without a migration.
+- Cost is ~0.04 ms per block (one 4096-cell pass + candidate scoring), the same
+  order as the mesher. Do not raise `COLLISION_RES` to 16 without re-measuring:
+  at 16³ the occupancy is 4096 cells and every catalogue shape covers far more
+  cells, which is where this stops being cheap.
+
+### Clipboard (blueprint copy/paste)
+
+`clipboard.lua` copies one block's **compressed** payload (grid + palette +
+base material) into player metadata and stamps it onto other nodes.
+Invariants:
+
+- The clipboard stores bytes, never a live `block` table: every paste decodes a
+  fresh grid, so one copy can be stamped any number of times without aliasing
+  world data.
+- Rotation/flip are applied at paste time (`M.rotate_grid`/`M.flip_grid`) and
+  the *state* lives in the clipboard, so the same copy can be stamped in four
+  orientations and mirrored without re-copying.
+- Pasting onto a chiseled block replaces its payload; onto a chiselable plain
+  node it converts it; onto air/passable it creates a block. Solid
+  non-chiselable nodes are refused, protected nodes are refused.
+- **Undo snapshots are taken before the mutation** (`M.begin_undo_entry` →
+  `M.add_undo_position` → mutate → `M.commit_undo_entry`). Snapshotting after
+  the paste records the new state and makes undo a no-op; that bug shipped once
+  and is now covered by tests.
 
 ---
 
@@ -254,6 +330,8 @@ half → the remaining slab's face; empty grid → nil.
 | Edits that silently did nothing | Brush material index written into the grid without registering it in the block palette; palette entries were never compacted, so the 4 slots filled with dead materials |
 | Crash `mesh.lua: attempt to compare number with nil` on any non-full block | The per-slice face mask is **sparse** (only exposed cells are stored), so `mask[...]` is `nil` for unexposed cells. `mat > 0` then compares nil. A fully solid block has a dense mask, which is why only slabs/carves crashed. Read masks as `mask[...] or 0` |
 | Shimmer / flicker along chiselled edges | Every face box drew all six of its quads, so a slab's side quad sat exactly in the neighbouring face box's outward plane — two opaque coplanar quads z-fighting. Fixed by drawing only the outward quad (§3) |
+| **Collision recognition never matched thin shapes** | The occupancy cell index was computed with a stray `+1` while the catalogue used a 0-based scheme. Full blocks still worked (fast path) and full-footprint shapes mostly cancelled the shift out, so only panels/posts/step shapes fell back to "empty". Caught by the shape tests; index both sides from the same formula |
+| **Paste could not be undone** | The undo snapshot was taken *after* the block was replaced, so it recorded the pasted state. Snapshots must be taken before the mutation (§2, "Clipboard") |
 | A crash in one self-test hid all later ones | The suites ran unwrapped in a single `core.after` callback, so the first error aborted the run. Each suite is now `pcall`ed and reported individually |
 | Process lesson | Never script a multi-part edit where one part can fail after another part was written. Run `python3 tools/headless_qc.py` before pushing — its strict-globals pass catches orphaned references, its render audit catches transform and crop regressions |
 
@@ -282,6 +360,13 @@ half → the remaining slab's face; empty grid → nil.
   - grid-step selection and that the selected step really changes a pushed
     volume (1³ vs 4³),
   - neighbour masks at both the full and the coarse stride,
+  - collision shape recognition: full/empty fast paths, slabs at 1/8 snapping,
+    all four stair orientations with two boxes each, panels and posts, the
+    floor/ceiling safe fallback, every catalogue shape registered with the
+    matching `collision_box`, and a per-call cost budget,
+  - clipboard: copy → paste equality, rotated paste equals `rotate_grid`,
+    conversion of plain nodes, liquid replacement, persisted rotation/flip,
+    empty-clipboard refusal and undo of a paste,
   - DDA picking and brush regions,
   - the **render audit**: chisel → carve → re-mesh, then verify every entity
     sits at its box center with the exact box size, inside the node, drawing
@@ -294,9 +379,10 @@ half → the remaining slab's face; empty grid → nil.
 
 | Limitation | Impact | Path forward |
 |---|---|---|
-| Collision is per block, not per cell | A block below 50 % solid becomes walk-through, above it collides as a full cube | Engine support for per-node collision boxes, or invisible physical entities |
+| Collision is a recognised shape, snapped to 1/8 node | A shape that matches no catalogue entry gets the safe fallback (floor/ceiling sheets become slabs, mid-node geometry uses the old 50 % rule), so carved detail below 12.5 cm collides as its snapped shape — up to one collision cell of invisible bulk, deliberately conservative so floors never open | Add catalogue entries for the shapes players actually build; engine support for per-node collision boxes |
 | Lighting is per node | A carved cavity still occludes sunlight as if solid | Engine micronode lighting (Phase 3 in `docs/subnode-editing-plan.md`) |
 | One entity per merged face | A chaotic carve can reach the budget (`micronode_chisel.max_render_boxes`, default 512) and then renders at a majority-coarsened downsample, which loses features smaller than a coarse cell but never turns the carve back into a full cube | Engine-side per-block mesh; raise the setting or set it to 0 while waiting |
 | 4 materials per block | Pushing a 5th material is refused with a message | Palette per face, or engine support |
 | Editing crosses node borders by creating neighbours | Pushing into a solid non-chiseled node does not convert it (it stops at the boundary) | Convert-on-push, needs a "was converted" marker for undo |
 | `swap_node` keeps metadata | A container node replaced by `/setnode` with leftover metadata is re-initialised empty | — |
+| Blueprint is single-node | Copy/paste stamps one node; a multi-node selection is not modelled | Copy a region into several blocks, or paste per node |

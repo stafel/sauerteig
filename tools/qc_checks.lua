@@ -446,16 +446,179 @@ do
 end
 
 -------------------------------------------------------------------------------
-print("[qc] collision variant")
+print("[qc] collision shapes")
 -------------------------------------------------------------------------------
 do
-	local grid = M.create_filled_grid(1)
-	check("collision_full_solid", M.collision_variant(grid) == M.BLOCK_NODE)
-	M.fill_box(grid, 1, 1, 1, 16, 16, 12, 0)
-	check("collision_open", M.collision_variant(grid) == M.BLOCK_NODE_OPEN,
-		string.format("%.2f solid", M.fill_ratio(grid)))
-	check("collision_ratio", near(M.fill_ratio(M.create_filled_grid(1)), 1))
-	check("collision_empty", M.collision_variant(M.create_empty_grid()) == M.BLOCK_NODE_OPEN)
+	local full = M.create_filled_grid(1)
+	local full_profile = M.collision_profile(full)
+	check("collision_full", full_profile.shape == "full"
+			and full_profile.node == M.BLOCK_NODE and full_profile.recognised,
+		full_profile.shape)
+
+	local empty_profile = M.collision_profile(M.create_empty_grid())
+	check("collision_empty", empty_profile.shape == "empty"
+			and empty_profile.node == M.BLOCK_NODE_OPEN
+			and not M.is_walkable_name(empty_profile.node))
+
+	-- Half slab, quarter slab, top slab: 1/8-node snapping of 1/16 geometry.
+	local half = M.create_empty_grid()
+	M.fill_box(half, 1, 1, 1, R, 8, R, 1)
+	check("collision_slab_half", M.collision_profile(half).shape == "slab_b4",
+		M.collision_profile(half).shape)
+
+	local top = M.create_filled_grid(1)
+	M.fill_box(top, 1, 1, 1, R, R - 4, R, 0)
+	check("collision_slab_top", M.collision_profile(top).shape == "slab_t2",
+		M.collision_profile(top).shape)
+
+	-- Staircases in all four orientations, two boxes each.
+	for _, dir in ipairs({"px", "nx", "pz", "nz"}) do
+		local grid = M.create_empty_grid()
+		M.fill_box(grid, 1, 1, 1, R, 8, R, 1)
+		if dir == "px" then
+			M.fill_box(grid, 9, 9, 1, R, R, R, 1)
+		elseif dir == "nx" then
+			M.fill_box(grid, 1, 9, 1, 8, R, R, 1)
+		elseif dir == "pz" then
+			M.fill_box(grid, 1, 9, 9, R, R, R, 1)
+		else
+			M.fill_box(grid, 1, 9, 1, R, R, 8, 1)
+		end
+		local profile = M.collision_profile(grid)
+		check("collision_stair_" .. dir,
+			profile.shape == "stair_" .. dir and profile.boxes == 2,
+			profile.shape .. " " .. profile.boxes .. " box(es)")
+	end
+
+	-- Thin shapes keep their footprint instead of becoming a full cube.
+	local panel = M.create_empty_grid()
+	M.fill_box(panel, 1, 1, 1, 4, R, R, 1)
+	check("collision_panel", M.collision_profile(panel).shape == "panel2_nx",
+		M.collision_profile(panel).shape)
+
+	local post = M.create_empty_grid()
+	M.fill_box(post, 9, 1, 9, R, R, R, 1)
+	check("collision_post", M.collision_profile(post).shape == "post_px_pz",
+		M.collision_profile(post).shape)
+
+	-- Unrecognised floor and ceiling sheets are anchored to a slab so they are
+	-- standable rather than walk-through.
+	local floor = M.create_empty_grid()
+	M.fill_box(floor, 1, 1, 1, 8, 4, R, 1)
+	local floor_profile = M.collision_profile(floor)
+	check("collision_fallback_floor", M.is_walkable_name(floor_profile.node),
+		floor_profile.shape)
+
+	local ceiling = M.create_empty_grid()
+	M.fill_box(ceiling, 1, R - 3, 1, 8, R, R, 1)
+	local ceiling_profile = M.collision_profile(ceiling)
+	check("collision_fallback_ceiling", M.is_walkable_name(ceiling_profile.node),
+		ceiling_profile.shape)
+
+	-- Geometry spanning floor to ceiling has no slab fallback: it must resolve
+	-- to a registered shape (a full cube), never to a missing slab.
+	local spans = M.create_empty_grid()
+	M.fill_box(spans, 1, 1, 1, 8, R, 8, 1)
+	M.fill_box(spans, 9, 1, 9, R, R, R, 1)
+	local spans_profile = M.collision_profile(spans)
+	check("collision_fallback_spans",
+		M.get_shape(spans_profile.shape) ~= nil and M.is_walkable_name(spans_profile.node),
+		spans_profile.shape)
+
+	-- Collision boxes of a stair are inside the node and two in number.
+	local stair = M.get_shape("stair_px")
+	local inside = #stair.nodeboxes == 2
+	for _, b in ipairs(stair.nodeboxes) do
+		if b[1] < -0.5 - 1e-9 or b[4] > 0.5 + 1e-9
+			or b[2] < -0.5 - 1e-9 or b[5] > 0.5 + 1e-9
+			or b[3] < -0.5 - 1e-9 or b[6] > 0.5 + 1e-9 then
+			inside = false
+		end
+	end
+	check("collision_stair_boxes_inside", inside,
+		"stair boxes stay within the node")
+
+	-- Every catalogue shape must be a registered container with collision.
+	local missing = 0
+	for _, shape in ipairs(M.get_shapes()) do
+		local name = M.shape_node_name(shape.id)
+		if not M.is_container_name(name) or not core.registered_nodes[name] then
+			missing = missing + 1
+		end
+	end
+	check("collision_nodes_registered", missing == 0, missing)
+
+	-- Recognition cost per edit (budget: well under one server tick).
+	local bench = M.create_filled_grid(1)
+	M.fill_box(bench, 1, 9, 1, R, R, R, 0)
+	M.fill_box(bench, 1, 1, 1, 8, R, R, 0)
+	local start = core.get_us_time()
+	for _ = 1, 20 do
+		M.collision_profile(bench)
+	end
+	local per_call = (core.get_us_time() - start) / 1000 / 20
+	check("collision_perf", per_call < 5, string.format("%.2f ms", per_call))
+end
+
+-------------------------------------------------------------------------------
+print("[qc] clipboard")
+-------------------------------------------------------------------------------
+do
+	local name = "qc_clip"
+	local src = {x = 10, y = 20, z = 30}
+	local dst = {x = 14, y = 20, z = 30}
+	M.forget_clipboard(name)
+
+	core.set_node(src, {name = "default:stone"})
+	M.chisel_native(src)
+	M.api_fill_box(src, 1, 9, 1, R, R, R, "air")
+	M.api_fill_box(src, 9, 1, 1, R, 8, 8, "air")
+	local expected = M.compress_grid(M.get_block(src).grid)
+
+	check("clipboard_starts_empty", M.clipboard_is_empty(name))
+	local ok, message = M.copy_block(name, src)
+	check("clipboard_copy", ok and not M.clipboard_is_empty(name), message)
+
+	ok = M.paste_block(name, dst, {player = name})
+	local pasted = M.get_block(dst)
+	check("clipboard_paste", ok and pasted ~= nil
+			and M.compress_grid(pasted.grid) == expected)
+
+	-- Undo must restore what the paste replaced (here: air).
+	check("clipboard_undo_removes", M.undo(name) and not M.is_micronode_block(dst))
+
+	-- Rotated paste equals rotate_grid of the source.
+	M.paste_block(name, dst, {player = name, rotate = 1})
+	pasted = M.get_block(dst)
+	local rotated = M.rotate_grid(M.get_block(src).grid, 1, R)
+	local same = pasted ~= nil
+	if same then
+		for i = 1, #rotated do
+			if rotated[i] ~= pasted.grid[i] then
+				same = false
+				break
+			end
+		end
+	end
+	check("clipboard_paste_rotated", same)
+
+	-- Converting a plain node and replacing a liquid.
+	local plain = {x = 18, y = 20, z = 30}
+	core.set_node(plain, {name = "default:stone"})
+	check("clipboard_paste_converts",
+		M.paste_block(name, plain, {player = name}) and M.is_micronode_block(plain))
+
+	local liquid = {x = 22, y = 20, z = 30}
+	core.set_node(liquid, {name = "default:water_source"})
+	check("clipboard_paste_liquid",
+		M.paste_block(name, liquid, {player = name}) and M.is_micronode_block(liquid))
+
+	check("clipboard_persisted_rotation",
+		M.rotate_clipboard(name, 1) and M.get_clipboard(name).rotate == 1
+			and M.flip_clipboard(name) and M.get_clipboard(name).flip == true)
+
+	M.forget_clipboard(name)
+	check("clipboard_empty_refused", not M.paste_block(name, dst, {}))
 end
 
 -------------------------------------------------------------------------------

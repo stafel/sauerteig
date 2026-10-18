@@ -93,6 +93,7 @@ Successfully implemented **Vintage Story-style micronode chiseling** for Luanti 
 - **Right click:** Remove micronodes
 - **Sneak + Left:** Cycle grid size (1/16, 1/8, 1/4, 1/2, 1/1)
 - **Right-click in air:** Open the chisel size menu (`/mn_menu`)
+- **Sneak + Aux1 + Left / Right:** Copy / paste a chiseled block (`/mn_copy`, `/mn_paste`)
 - **Sneak + Right:** Cycle material slot (1-4)
 - **Aux1 (E) + Left:** Rotate block 90°
 - **Right click (secondary):** Show block info

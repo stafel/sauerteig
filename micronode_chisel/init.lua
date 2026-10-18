@@ -24,7 +24,7 @@
 micronode_chisel = {}
 local M = micronode_chisel
 
-M.VERSION = "2.1.0"
+M.VERSION = "2.2.0"
 
 local modpath = core.get_modpath("micronode_chisel")
 for _, file in ipairs({
@@ -34,6 +34,7 @@ for _, file in ipairs({
 	"edit.lua",
 	"entities.lua",
 	"render.lua",
+	"clipboard.lua",
 	"chisel.lua",
 	"api.lua",
 }) do

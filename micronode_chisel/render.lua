@@ -184,10 +184,17 @@ print("[micronode_chisel] Renderer loaded")
 core.register_lbm({
 	name = "micronode_chisel:rebuild_meshes",
 	label = "Rebuild micronode render entities",
-	nodenames = {M.BLOCK_NODE, M.BLOCK_NODE_OPEN},
+	nodenames = M.container_node_names(),
 	run_at_every_load = true,
 	action = function(pos)
 		M.forget_block(pos)
+		-- Re-pick the collision variant: worlds saved by older builds only know
+		-- the two legacy node types, and a new shape catalogue should apply
+		-- without an explicit migration.
+		local block = M.get_block(pos)
+		if block then
+			M.update_collision_node(pos, block)
+		end
 		M.update_block_mesh(pos)
 	end,
 })

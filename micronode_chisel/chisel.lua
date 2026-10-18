@@ -5,14 +5,16 @@
 --   left click on a chiseled block -> push: add a grid-thick layer on the face
 --   right click on a chiseled block -> pull: carve a grid-thick layer inwards
 --   sneak + left                 -> cycle grid step (1 2 4 8 16 micronodes)
---   right click in air           -> open the size menu (buttons, discoverable)
+--   right click in air           -> open the size/clipboard menu
 --   sneak + right                -> pick the material of the targeted node, or
 --                                   cycle the palette of a chiseled block
 --   aux1 + left / aux1 + right   -> rotate 90 deg / flip the block
+--   sneak + aux1 + left          -> copy the targeted chiseled block
+--   sneak + aux1 + right         -> paste it (current rotation/flip)
 --
 -- The grid step is per player, applied to the brush (both the layer thickness
 -- and the in-plane extent), and persisted in player metadata so it survives a
--- reconnect.
+-- reconnect. The clipboard (clipboard.lua) is persisted the same way.
 
 local M = micronode_chisel
 
@@ -119,7 +121,7 @@ function M.show_size_menu(player)
 	local st = get_state(name)
 	local parts = {
 		"formspec_version[4]",
-		"size[8.6,5.2]",
+		"size[8.6,7.0]",
 		"label[0.4,0.3;Chisel size]",
 	}
 	local x = 0.4
@@ -134,7 +136,11 @@ function M.show_size_menu(player)
 	parts[#parts + 1] = "label[0.4,2.5;Material: " .. tostring(st.material or "(surface or picked)") .. "]"
 	parts[#parts + 1] = "label[0.4,3.0;Left click: push / chisel.  Right click: carve.]"
 	parts[#parts + 1] = "label[0.4,3.5;Sneak+Left on a block still cycles the size.]"
-	parts[#parts + 1] = "button_exit[2.8,4.2;3,0.7;close;Close]"
+	parts[#parts + 1] = "label[0.4,4.2;Clipboard: " .. M.clipboard_label(name) .. "]"
+	parts[#parts + 1] = "button[0.4,4.6;2.4,0.8;clip_rot;Rotate 90]"
+	parts[#parts + 1] = "button[3.0,4.6;2.4,0.8;clip_flip;Flip]"
+	parts[#parts + 1] = "label[0.4,5.6;Sneak+Aux1+Left copies, Sneak+Aux1+Right pastes.]"
+	parts[#parts + 1] = "button_exit[2.8,6.2;3,0.6;close;Close]"
 	core.show_formspec(name, SIZE_FORMNAME, table.concat(parts))
 end
 
@@ -149,12 +155,11 @@ end
 -------------------------------------------------------------------------------
 -- Container nodes
 -------------------------------------------------------------------------------
--- The container is invisible (airlike) and holds the grid in metadata. Two
--- variants exist because a node can only carry one collision behaviour:
---  * chiseled_block       solid cells >= COLLISION_SOLID_RATIO -> collidable
---  * chiseled_block_open  mostly carved -> walk-through (a doorway you carved
---                         is actually usable). Per-cell collision for nodes is
---                         not expressible in the Luanti node API.
+-- The container is invisible (airlike) and holds the grid in metadata. One node
+-- type per recognised collision shape: a collision box is a per-type property
+-- and the engine supports a list of boxes per type, so a recognised staircase
+-- is a variant with two boxes (see collision.lua). The empty shape is the one
+-- non-walkable variant, which is what makes a carved-out block passable.
 
 local function drop_base(pos)
 	local block = M.get_block(pos)
@@ -165,8 +170,12 @@ local function drop_base(pos)
 	return M.fallback_material_or_default()
 end
 
-local function container_def(description, walkable)
-	return {
+-- `nodeboxes` is a list of node-local aabbs for the collision shape. A
+-- collision box is a per-node-*type* property, so each recognised shape gets
+-- its own variant node (see collision.lua); several boxes per type are
+-- supported by the engine (`collision_box = {type = "fixed", fixed = {...}}`).
+local function container_def(description, walkable, nodeboxes)
+	local def = {
 		description = description,
 		drawtype = "airlike",
 		paramtype = "light",
@@ -177,10 +186,9 @@ local function container_def(description, walkable)
 		tiles = {"micronode_chisel_placeholder.png"},
 		groups = {cracky = 2, oddly_breakable_by_hand = 1,
 			micronode_block = 1, not_in_creative_inventory = 1},
+		-- Pointable across the whole node volume: otherwise the empty part of a
+		-- carved block would not be clickable and could not be pushed into.
 		selection_box = {type = "regular"},
-		-- Collision only applies to walkable nodes, so the open variant simply
-		-- has no collision box of its own (see collision.lua).
-		collision_box = walkable and {type = "regular"} or nil,
 
 		on_construct = function(pos)
 			local meta = core.get_meta(pos)
@@ -215,10 +223,33 @@ local function container_def(description, walkable)
 			return true
 		end,
 	}
+
+	-- Collision only applies to walkable nodes, so the empty variant simply has
+	-- no collision box of its own.
+	if walkable then
+		if nodeboxes and #nodeboxes > 0 then
+			def.collision_box = {type = "fixed", fixed = nodeboxes}
+		else
+			def.collision_box = {type = "regular"}
+		end
+	end
+	return def
 end
 
 core.register_node(M.BLOCK_NODE, container_def("Chiseled Block", true))
 core.register_node(M.BLOCK_NODE_OPEN, container_def("Chiseled Block (open)", false))
+
+-- One variant per recognised collision shape (slabs, stairs, panels, posts...).
+for _, shape in ipairs(M.get_shapes()) do
+	if not M.CONTAINER_NODES[M.shape_node_name(shape.id)] then
+		error("shape node " .. M.shape_node_name(shape.id) .. " is not a container")
+	end
+	if shape.id ~= "full" and shape.id ~= "empty" then
+		local label = "Chiseled Block (" .. shape.id:gsub("_", " ") .. ")"
+		core.register_node(M.shape_node_name(shape.id),
+			container_def(label, true, shape.nodeboxes))
+	end
+end
 
 -------------------------------------------------------------------------------
 -- Tool
@@ -228,10 +259,12 @@ core.register_tool("micronode_chisel:chisel", {
 	description = "Micronode Chisel\n" ..
 		"Left: chisel block / push material\n" ..
 		"Right: carve material\n" ..
-		"Right-click air: size menu\n" ..
+		"Right-click air: size and clipboard menu\n" ..
 		"Sneak+Left: cycle size\n" ..
 		"Sneak+Right: pick or cycle material\n" ..
-		"Aux1+Left: rotate, Aux1+Right: flip",
+		"Aux1+Left: rotate, Aux1+Right: flip\n" ..
+		"Sneak+Aux1+Left: copy block\n" ..
+		"Sneak+Aux1+Right: paste block",
 	inventory_image = "micronode_chisel_chisel.png",
 	groups = {chisel = 1},
 
@@ -249,6 +282,17 @@ core.register_tool("micronode_chisel:chisel", {
 
 		if not can_edit(name) then
 			tell(name, "You need the 'chisel' privilege to edit blocks")
+			return
+		end
+
+		-- sneak+aux1+left copies the targeted block. Checked before the plain
+		-- sneak/aux1 verbs so the modifier combination wins.
+		if ctrl.sneak and ctrl.aux1 then
+			local ok, message = M.copy_block(name, pos)
+			tell(name, message)
+			if ok then
+				tell(name, "Paste with sneak+aux1+right (" .. M.clipboard_label(name) .. ")")
+			end
 			return
 		end
 
@@ -323,6 +367,14 @@ core.register_tool("micronode_chisel:chisel", {
 			return itemstack
 		end
 
+		-- sneak+aux1+right pastes the clipboard, overwriting or converting the
+		-- targeted node.
+		if ctrl.sneak and ctrl.aux1 then
+			local ok, message = M.paste_block(name, pos, {player = name})
+			tell(name, message)
+			return itemstack
+		end
+
 		if ctrl.sneak then
 			if M.is_micronode_block(pos) then
 				local block = M.get_block(pos)
@@ -371,12 +423,22 @@ core.register_tool("micronode_chisel:chisel", {
 })
 
 -- Size menu clicks. Re-rendering the menu after a click keeps the active step
--- visible without closing and reopening it.
+-- and the clipboard state visible without closing and reopening it.
 core.register_on_player_receive_fields(function(player, formname, fields)
 	if formname ~= SIZE_FORMNAME then
 		return false
 	end
 	local name = player:get_player_name()
+	if fields.clip_rot then
+		M.rotate_clipboard(name, 1)
+		M.show_size_menu(player)
+		return true
+	end
+	if fields.clip_flip then
+		M.flip_clipboard(name)
+		M.show_size_menu(player)
+		return true
+	end
 	for idx = 1, #M.GRID_SIZES do
 		if fields["size_" .. idx] then
 			get_state(name).grid_idx = idx
@@ -494,6 +556,73 @@ core.register_chatcommand("mn_material", {
 	end,
 })
 
+core.register_chatcommand("mn_copy", {
+	params = "",
+	description = "Copy the chiseled block you are pointing at",
+	func = function(name)
+		local player = core.get_player_by_name(name)
+		if not player then
+			return false, "Player not found"
+		end
+		local pos = M.get_pointed_block(player)
+		if not pos then
+			return false, "Point at a chiseled block"
+		end
+		local ok, message = M.copy_block(name, pos)
+		return ok, message
+	end,
+})
+
+core.register_chatcommand("mn_paste", {
+	params = "[0|90|180|270] [flip]",
+	description = "Paste the copied block onto the node you are pointing at",
+	func = function(name, param)
+		local player = core.get_player_by_name(name)
+		if not player then
+			return false, "Player not found"
+		end
+		if M.clipboard_is_empty(name) then
+			return false, "Clipboard is empty: /mn_copy a chiseled block first"
+		end
+		local pos = M.get_pointed_node(player)
+		if not pos then
+			return false, "Point at a node"
+		end
+
+		local rotate, flip = M.get_clipboard(name).rotate or 0, nil
+		for word in string.gmatch(param or "", "%S+") do
+			local degrees = tonumber(word)
+			if degrees then
+				if degrees % 90 ~= 0 then
+					return false, "Rotation must be 0, 90, 180 or 270"
+				end
+				rotate = math.floor(degrees / 90) % 4
+			elseif word == "flip" then
+				flip = true
+			else
+				return false, "Usage: /mn_paste [0|90|180|270] [flip]"
+			end
+		end
+
+		return M.paste_block(name, pos, {player = name, rotate = rotate, flip = flip})
+	end,
+})
+
+core.register_chatcommand("mn_clip", {
+	params = "[rot|flip]",
+	description = "Show the clipboard, or cycle its rotation / toggle its flip",
+	func = function(name, param)
+		if param == "rot" then
+			local clip = M.rotate_clipboard(name, 1)
+			return true, "Paste rotation: " .. tostring(clip.rotate * 90) .. " deg"
+		elseif param == "flip" then
+			local clip = M.flip_clipboard(name)
+			return true, "Paste flip: " .. (clip.flip and "on" or "off")
+		end
+		return true, "Clipboard: " .. M.clipboard_label(name)
+	end,
+})
+
 core.register_chatcommand("mn_info", {
 	params = "",
 	description = "Show info about the chiseled block you are pointing at",
@@ -511,9 +640,14 @@ core.register_chatcommand("mn_info", {
 			return false, "Point at a chiseled block"
 		end
 		return true, string.format(
-			"base=%s fill=%d/%d (%.1f%%) palette=%s stored=%d bytes",
+			"base=%s fill=%d/%d (%.1f%%) palette=%s stored=%d bytes collision=%s "
+				.. "(%d box(es)%s)",
 			info.base, info.solid_count, info.total_voxels, info.fill_percent,
-			table.concat(info.palette, ","), info.stored_bytes)
+			table.concat(info.palette, ","), info.stored_bytes,
+			info.collision_shape, info.collision_boxes,
+			info.collision_recognised
+				and string.format(", %.0f%% match", info.collision_iou * 100)
+				or ", fill-ratio fallback")
 	end,
 })
 
@@ -569,6 +703,7 @@ core.register_on_leaveplayer(function(player)
 	local name = player:get_player_name()
 	save_state(name)
 	state[name] = nil
+	M.forget_clipboard(name)
 	M.forget_player(name)
 end)
 
