@@ -254,6 +254,15 @@ function M.generate_surface_faces(grid, palette, solid_outside, res)
 	local R = res or M.RESOLUTION
 	local rects = {}
 
+	-- Local voxel access indexed with THIS grid's resolution: M.get_voxel
+	-- hardcodes the 16^3 stride and misindexes coarse grids.
+	local function voxel(x, y, z)
+		if x < 1 or x > R or y < 1 or y > R or z < 1 or z > R then
+			return 0
+		end
+		return grid[(z - 1) * R * R + (y - 1) * R + x] or 0
+	end
+
 	local function nb0(c) return (c - 1) / R - 0.5 end
 	local function nb1(c) return c / R - 0.5 end
 

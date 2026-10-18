@@ -78,7 +78,8 @@ end
 function M.count_solid(grid)
 	local count = 0
 	for i = 1, M.VOXEL_COUNT do
-		if grid[i] ~= 0 then
+		local v = grid[i]
+		if v and v ~= 0 then
 			count = count + 1
 		end
 	end
