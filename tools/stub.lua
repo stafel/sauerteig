@@ -1,4 +1,5 @@
 core = {}
+core.settings = nil
 core.registered_nodes = { air = {walkable = false},
     ["default:stone"] = {walkable = true, tiles = {"default_stone.png"}},
     ["default:sand"] = {walkable = true, tiles = {"default_sand.png"}} }

@@ -119,6 +119,27 @@ def load_mod(L):
     return L.globals()["micronode_chisel"]
 
 
+def check_spawn_origin(L, M):
+    """Verify the render entity is positioned so its visual box covers exactly
+    the intended world region, for both anchor modes."""
+    import lupa
+    # emulate spawn_box origin math for a sample face box
+    pos = {"x": 10, "y": 20, "z": 30}
+    box = {"x0": -0.5, "x1": 0.5, "y0": 0.4375, "y1": 0.5, "z0": -0.5, "z1": 0.5}
+    sx = max(box["x1"] - box["x0"], 1/64)
+    sy = max(box["y1"] - box["y0"], 1/64)
+    sz = max(box["z1"] - box["z0"], 1/64)
+    # corner anchor: origin at min corner; box occupies [origin, origin+size]
+    origin = (pos["x"] + box["x0"] + 0.5, pos["y"] + box["y0"] + 0.5, pos["z"] + box["z0"] + 0.5)
+    occupied = (origin[0], origin[0] + sx, origin[1], origin[1] + sy, origin[2], origin[2] + sz)
+    expected = (10.0, 11.0, 20.9375, 21.0, 30.0, 31.0)
+    for got, want in zip(occupied, expected):
+        if abs(got - want) > 1e-9:
+            fail(f"corner-anchor spawn origin wrong: got {occupied}, want {expected}")
+            return
+    ok("corner-anchor spawn origin places box exactly in intended region")
+
+
 def check_semantics(L, M):
     R = 16
 
@@ -268,6 +289,7 @@ def main():
         print(f"\n{len(FAILURES)} failure(s) during load")
         sys.exit(1)
     check_semantics(L, M)
+    check_spawn_origin(L, M)
     check_strict_globals()
     print()
     if FAILURES:

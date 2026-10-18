@@ -137,11 +137,21 @@ local function spawn_box(pos, box, texture)
 	local sx = math.max(box.x1 - box.x0, FACE_EPSILON)
 	local sy = math.max(box.y1 - box.y0, FACE_EPSILON)
 	local sz = math.max(box.z1 - box.z0, FACE_EPSILON)
-	-- Entity sits at the box center; the cube visual extends +/- size/2
-	local center = vector.add(pos, vector.new(
-		(box.x0 + box.x1) / 2 + 0.5,
-		(box.y0 + box.y1) / 2 + 0.5,
-		(box.z0 + box.z1) / 2 + 0.5))
+	-- Anchor calibration: the cube visual's anchor point. "corner" places the
+	-- entity at the box's min corner and the cube extends +size from it
+	-- (matches observed 5.17.0 rendering); "center" places it at the box
+	-- center with +/- size/2 extent. Configurable in case other builds
+	-- anchor differently.
+	local anchor = core.settings and core.settings:get("micronode_chisel.anchor") or "corner"
+	local origin
+	if anchor == "center" then
+		origin = vector.add(pos, vector.new(
+			(box.x0 + box.x1) / 2 + 0.5,
+			(box.y0 + box.y1) / 2 + 0.5,
+			(box.z0 + box.z1) / 2 + 0.5))
+	else
+		origin = vector.add(pos, vector.new(box.x0 + 0.5, box.y0 + 0.5, box.z0 + 0.5))
+	end
 	local data = core.write_json({
 		block_pos = {x = pos.x, y = pos.y, z = pos.z},
 		sx = sx,
@@ -149,7 +159,7 @@ local function spawn_box(pos, box, texture)
 		sz = sz,
 		texs = face_textures(texture, box),
 	})
-	core.add_entity(center, ENTITY_NAME, data)
+	core.add_entity(origin, ENTITY_NAME, data)
 end
 
 ------------------------------------------------------------------------------
