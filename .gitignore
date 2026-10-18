@@ -1,0 +1,11 @@
+# Engine sources (cloned upstream, not part of this project's history)
+/luanti/
+/sauerbraten/
+
+# Lua test servers built from the luanti source
+/luanti-build/
+
+# OS/editor noise
+*.swp
+*~
+.directory
