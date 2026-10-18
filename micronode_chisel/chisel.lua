@@ -216,6 +216,31 @@ function M.get_block_info(pos)
 end
 
 ------------------------------------------------------------------------------
+-- Map the exact look-ray hit on a block face to micronode coordinates
+-- (1..M.RESOLUTION). pointed_thing only carries integer node positions, so
+-- raycast from the player's eye to obtain the precise intersection point.
+local function face_hit_to_micronode(pos, player, pointed)
+	local eye = vector.add(player:get_pos(), vector.new(0, 1.475, 0))
+	local ray_end = vector.add(eye, vector.multiply(player:get_look_dir(), 8))
+	local ray = core.raycast(eye, ray_end, false, false)
+	for hit in ray do
+		if hit.type == "node" and vector.equals(hit.under, pos) then
+			local o = vector.subtract(hit.intersection_point, pos)
+			return M.offset_to_micronode(
+				math.max(0, math.min(1, o.x)),
+				math.max(0, math.min(1, o.y)),
+				math.max(0, math.min(1, o.z)))
+		end
+	end
+	-- Fallback: middle of the pointed face
+	local d = vector.subtract(pointed.above, pos)
+	local o = vector.multiply(d, 0.5)
+	return M.offset_to_micronode(
+		math.max(0, math.min(1, o.x)),
+		math.max(0, math.min(1, o.y)),
+		math.max(0, math.min(1, o.z)))
+end
+
 -- Chisel Tool Registration
 ------------------------------------------------------------------------------
 
@@ -281,37 +306,7 @@ core.register_tool("micronode_chisel:chisel", {
 			return
 		end
 		do -- add voxels
-			-- Calculate micronode position from pointed position
-			local above = pointed_thing.above
-			local dir = vector.subtract(above, pos)
-
-			-- Project onto block face to get 2D coordinates
-			local mx, my, mz = 8, 8, 8 -- Default center
-			if dir.y == 1 then -- Top face
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				my = M.RESOLUTION
-			elseif dir.y == -1 then -- Bottom face
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				my = 1
-			elseif dir.x == 1 then -- Right face
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				mx = M.RESOLUTION
-			elseif dir.x == -1 then -- Left face
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				mx = 1
-			elseif dir.z == 1 then -- Front face
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = M.RESOLUTION
-			else -- dir.z == -1, Back face
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = 1
-			end
+			local mx, my, mz = face_hit_to_micronode(pos, user, pointed_thing)
 
 			-- Add material
 			M.edit_micronodes(pos, mx, my, mz, get_grid_size(st), st.material_idx, true)
@@ -353,35 +348,7 @@ core.register_tool("micronode_chisel:chisel", {
 		else
 			return
 		end
-		local above = pointed_thing.above
-			local dir = vector.subtract(above, pos)
-
-			local mx, my, mz = 8, 8, 8
-			if dir.y == 1 then
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				my = M.RESOLUTION
-			elseif dir.y == -1 then
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				my = 1
-			elseif dir.x == 1 then
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				mx = M.RESOLUTION
-			elseif dir.x == -1 then
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = math.floor((above.z - pos.z) * M.RESOLUTION) + 1
-				mx = 1
-			elseif dir.z == 1 then
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = M.RESOLUTION
-			else
-				mx = math.floor((above.x - pos.x) * M.RESOLUTION) + 1
-				my = math.floor((above.y - pos.y) * M.RESOLUTION) + 1
-				mz = 1
-			end
+		local mx, my, mz = face_hit_to_micronode(pos, user, pointed_thing)
 
 			M.edit_micronodes(pos, mx, my, mz, get_grid_size(st), 0, false)
 			local info = M.get_block_info(pos)
