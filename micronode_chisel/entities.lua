@@ -105,6 +105,11 @@ end
 local function crop_16(tex, u0, v0, u1, v1)
 	-- Normalize to 16px so the crop is texture-pack agnostic
 	local base = tex .. "^[resize:16x16"
+	-- face boxes may have reversed extents (inward depth): normalize the
+	-- region, else the blit lands outside the canvas and the face goes
+	-- fully transparent (invisible)
+	if u1 < u0 then u0, u1 = u1, u0 end
+	if v1 < v0 then v0, v1 = v1, v0 end
 	local x = math.floor(math.max(0, math.min(1, u0)) * 16 + 0.5)
 	local y = math.floor(math.max(0, math.min(1, v0)) * 16 + 0.5)
 	local w = math.max(1, math.floor(math.max(0, math.min(1, u1)) * 16 + 0.5) - x)
