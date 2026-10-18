@@ -279,7 +279,7 @@ function M.generate_surface_faces(grid, palette, solid_outside, res)
 					mask[u], visited[u] = {}, {}
 					for v = 1, R do
 						local x, y, z = voxel_at(axis, s, u, v)
-						local mat = M.get_voxel(grid, x, y, z)
+						local mat = voxel(x, y, z)
 						visited[u][v] = false
 						mask[u][v] = 0
 						if mat > 0 then
@@ -290,7 +290,7 @@ function M.generate_surface_faces(grid, palette, solid_outside, res)
 							local open
 							if nx >= 1 and nx <= R and ny >= 1 and ny <= R
 								and nz >= 1 and nz <= R then
-								open = M.get_voxel(grid, nx, ny, nz) == 0
+								open = voxel(nx, ny, nz) == 0
 							else
 								-- solid_outside[key] is true when the
 								-- neighboring Luanti node is NOT walkable
