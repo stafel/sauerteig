@@ -1,252 +1,165 @@
--- Public API for micronode_chisel
--- Other mods can use this to interact with chiseled blocks
+-- Public API for other mods.
+-- Coordinates are 1-based micronode indices (1..RESOLUTION), local to one
+-- block; world positions are ordinary node positions.
 
 local M = micronode_chisel
 
--- API version
-M.API_VERSION = "1.0"
+M.API_VERSION = "2.1"
 
-------------------------------------------------------------------------------
--- Block Operations
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Block operations
+-------------------------------------------------------------------------------
 
---- Check if position has a chiseled block
+-- Is there a chiseled block at pos?
 function M.api_is_chiseled(pos)
 	return M.is_micronode_block(pos)
 end
 
---- Chisel a block at position
--- @param pos: position vector
--- @param base_material: optional base material name (default: current node)
--- @return: success boolean
+-- Convert the node at pos into a chiseled block that looks identical.
+-- Pass base_material to chisel air (creates an empty block of that material).
+-- Returns true on success.
 function M.api_chisel(pos, base_material)
-	local node = core.get_node(pos)
-	local material = base_material or node.name
-
-	if not M.is_chiselable(pos) and not base_material then
-		return false
+	if M.is_micronode_block(pos) then
+		return true
 	end
-
-	local palette = M.create_palette({material})
-	local grid = M.create_filled_grid(1)
-
-	local meta = core.get_meta(pos)
-	local block_data = M.create_block_data(material, palette, grid, 0)
-	local serialized = M.serialize_block_data(block_data)
-
-	meta:set_string(M.META_KEY_DATA, serialized.data)
-	meta:set_string(M.META_KEY_PALETTE, serialized.palette)
-	meta:set_string(M.META_KEY_ROTATION, serialized.rotation)
-	meta:set_string(M.META_KEY_BASE, serialized.base)
-
-	core.swap_node(pos, {name = "micronode_chisel:chiseled_block", param2 = 0})
-	M.update_block_mesh(pos)
-
-	return true
+	if M.chisel_native(pos) then
+		M.refresh_block(pos)
+		return true
+	end
+	if base_material then
+		local block = M.ensure_chiseled(pos, base_material, true)
+		if block then
+			M.refresh_block(pos)
+			return true
+		end
+	end
+	return false
 end
 
---- Unchisel a block (convert back to regular node)
--- @param pos: position vector
--- @return: base material name or nil
+-- Convert a chiseled block back into a plain node of its base material.
+-- Returns the node name, or nil when pos is not a chiseled block.
 function M.api_unchisel(pos)
-	if not M.is_micronode_block(pos) then
-		return nil
-	end
-
-	local meta = core.get_meta(pos)
-	local base = meta:get_string(M.META_KEY_BASE)
-	if base == "" then
-		base = M.get_fallback_material()
-	end
-
-	core.swap_node(pos, {name = base})
-	return base
+	return M.unchisel(pos)
 end
 
---- Get block data
 function M.api_get_block_data(pos)
-	if not M.is_micronode_block(pos) then
-		return nil
-	end
 	return M.get_block_info(pos)
 end
 
---- Get raw grid data
+-- Returns grid, palette (grid is a flat array of palette indices, 0 = air).
 function M.api_get_grid(pos)
-	local meta = core.get_meta(pos)
-	local data_str = meta:get_string(M.META_KEY_DATA)
-	if data_str == "" then return nil end
-
-	local block_data = M.deserialize_block_data({
-		data = data_str,
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-	return block_data.grid, block_data.palette
+	local block = M.get_block(pos)
+	if not block then
+		return nil
+	end
+	return block.grid, block.palette
 end
 
-------------------------------------------------------------------------------
--- Voxel Operations
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Voxel operations
+-------------------------------------------------------------------------------
 
---- Set voxel at micronode position
--- @param pos: block position
--- @param mx, my, mz: micronode coordinates (1-16)
--- @param material: material name (or "air" to remove)
--- @return: success
+-- Set one micronode. material == nil or "air" clears it.
 function M.api_set_voxel(pos, mx, my, mz, material)
-	if not M.is_micronode_block(pos) then return false end
-
-	local meta = core.get_meta(pos)
-	local block_data = M.deserialize_block_data({
-		data = meta:get_string(M.META_KEY_DATA),
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	-- Find or add material to palette
-	local mat_idx = 0
-	if material and material ~= "air" then
-		mat_idx = M.palette_add(block_data.palette, material)
-		if not mat_idx then
-			return false -- Palette full
-		end
-	end
-
-	M.set_voxel(block_data.grid, mx, my, mz, mat_idx)
-
-	-- Save
-	local serialized = M.serialize_block_data(block_data)
-	meta:set_string(M.META_KEY_DATA, serialized.data)
-	meta:set_string(M.META_KEY_PALETTE, serialized.palette)
-
-	M.update_block_mesh(pos)
-	return true
+	return M.api_fill_box(pos, mx, my, mz, mx, my, mz, material)
 end
 
---- Fill a box region with material
--- @param pos: block position
--- @param x1, y1, z1: start micronode coords (1-16)
--- @param x2, y2, z2: end micronode coords (1-16)
--- @param material: material name (or "air")
--- @return: success
+-- Fill an inclusive local box with a material (nil/"air" carves it out).
 function M.api_fill_box(pos, x1, y1, z1, x2, y2, z2, material)
-	if not M.is_micronode_block(pos) then return false end
-
-	local meta = core.get_meta(pos)
-	local block_data = M.deserialize_block_data({
-		data = meta:get_string(M.META_KEY_DATA),
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	local mat_idx = 0
-	if material and material ~= "air" then
-		mat_idx = M.palette_add(block_data.palette, material)
-		if not mat_idx then
-			return false
-		end
+	local block = M.get_block(pos)
+	if not block then
+		return false
 	end
-
-	M.fill_box(block_data.grid, x1, y1, z1, x2, y2, z2, mat_idx)
-
-	local serialized = M.serialize_block_data(block_data)
-	meta:set_string(M.META_KEY_DATA, serialized.data)
-	meta:set_string(M.META_KEY_PALETTE, serialized.palette)
-
-	M.update_block_mesh(pos)
+	local fill = material
+	if M.is_air_name(fill) then
+		fill = nil
+	end
+	local region = M.ordered_region(x1 - 1, y1 - 1, z1 - 1, x2 - 1, y2 - 1, z2 - 1)
+	M.apply_region(pos, region, fill, {create = false, base_material = material})
 	return true
 end
 
---- Get voxel material at position
--- @param pos: block position
--- @param mx, my, mz: micronode coordinates (1-16)
--- @return: material name or "air"
+-- Material name of a micronode ("air" when empty).
 function M.api_get_voxel(pos, mx, my, mz)
-	local grid, palette = M.api_get_grid(pos)
-	if not grid then return "air" end
-
-	local mat_idx = M.get_voxel(grid, mx, my, mz)
-	return M.palette_get(palette, mat_idx)
+	local block = M.get_block(pos)
+	if not block then
+		return "air"
+	end
+	return M.palette_get(block.palette, M.get_voxel(block.grid, mx, my, mz, M.RESOLUTION))
 end
 
-------------------------------------------------------------------------------
--- Transform Operations
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Transforms
+-------------------------------------------------------------------------------
 
---- Rotate chiseled block
--- @param pos: block position
--- @param times: number of 90° rotations (default 1)
--- @return: success
 function M.api_rotate(pos, times)
-	return M.rotate_block(pos, times)
+	return M.rotate_block(pos, times or 1)
 end
 
---- Flip chiseled block horizontally
--- @param pos: block position
--- @return: success
 function M.api_flip(pos)
-	if not M.is_micronode_block(pos) then return false end
-
-	local meta = core.get_meta(pos)
-	local block_data = M.deserialize_block_data({
-		data = meta:get_string(M.META_KEY_DATA),
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	block_data.grid = M.flip_grid(block_data.grid)
-
-	local serialized = M.serialize_block_data(block_data)
-	meta:set_string(M.META_KEY_DATA, serialized.data)
-
-	M.update_block_mesh(pos)
-	return true
+	return M.flip_block(pos)
 end
 
-------------------------------------------------------------------------------
--- Statistics
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Collision and clipboard
+-------------------------------------------------------------------------------
 
---- Get statistics about a chiseled block
+-- Collision approximation of a chiseled block:
+-- {shape, node, boxes, iou, recall, fill, recognised} or nil.
+function M.api_collision(pos)
+	local block = M.get_block(pos)
+	if not block then
+		return nil
+	end
+	return M.collision_profile(block.grid)
+end
+
+-- Copy the block at `pos` into a clipboard owned by `owner` (any string, so a
+-- mod can keep its own blueprint). Returns ok, message.
+function M.api_copy(pos, owner)
+	return M.copy_block(owner or "@api", pos)
+end
+
+-- Paste `owner`'s clipboard at `pos`. opts: rotate (quarter turns), flip,
+-- player (name used for protection checks and undo, defaults to `owner`).
+function M.api_paste(pos, owner, opts)
+	opts = opts or {}
+	if not opts.player then
+		opts.player = owner or "@api"
+	end
+	return M.paste_block(owner or "@api", pos, opts)
+end
+
+-------------------------------------------------------------------------------
+-- Statistics
+-------------------------------------------------------------------------------
+
 function M.api_get_stats(pos)
 	local info = M.get_block_info(pos)
-	if not info then return nil end
-
+	if not info then
+		return nil
+	end
 	return {
 		solid_voxels = info.solid_count,
 		total_voxels = info.total_voxels,
 		fill_percent = info.fill_percent,
+		stored_bytes = info.stored_bytes,
 		compression_ratio = info.compression_ratio,
-		estimated_storage_bytes = #M.compress_grid(
-			M.decompress_grid(core.get_meta(pos):get_string(M.META_KEY_DATA))
-		),
 	}
 end
 
---- Count all chiseled blocks in an area
+-- Count chiseled blocks in an inclusive area. Expensive: walks every cell.
 function M.api_count_chiseled(min_pos, max_pos)
 	local count = 0
-	local vm = VoxelManip(min_pos, max_pos)
-	vm:read_from_map(min_pos, max_pos)
-	-- Note: This is expensive for large areas
-	-- In production, maintain a spatial index
-
 	for x = min_pos.x, max_pos.x do
 		for y = min_pos.y, max_pos.y do
 			for z = min_pos.z, max_pos.z do
-				local pos = vector.new(x, y, z)
-				if M.is_micronode_block(pos) then
+				if M.is_micronode_block({x = x, y = y, z = z}) then
 					count = count + 1
 				end
 			end
 		end
 	end
-
 	return count
 end
 

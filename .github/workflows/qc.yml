@@ -1,0 +1,34 @@
+name: QC
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  headless-qc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lupa
+        run: pip install lupa
+      - name: Syntax check (all Lua files)
+        run: |
+          pip install luaparser
+          python3 - <<'PY'
+          import glob
+          from luaparser import ast
+          failed = False
+          for f in glob.glob("micronode_chisel/*.lua"):
+              try:
+                  ast.parse(open(f).read())
+                  print("OK", f)
+              except Exception as e:
+                  print("FAIL", f, e)
+                  failed = True
+          raise SystemExit(1 if failed else 0)
+          PY
+      - name: Headless semantic QC (strict globals + functional tests)
+        run: python3 tools/headless_qc.py

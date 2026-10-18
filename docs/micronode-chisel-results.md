@@ -5,6 +5,14 @@
 **Location:** `luanti/games/devtest/mods/micronode_chisel/`
 **Flatpak Symlink:** `~/.var/app/org.luanti.luanti/.minetest/mods/micronode_chisel`
 
+> **Superseded (rendering/edit layer).** The numbers below still describe the
+> data model, but the rendering and edit layers were rewritten after the
+> in-game round showed disconnected faces instead of a continuous block: cube
+> entities were positioned at their min corner although the engine centers them.
+> The current architecture, engine facts and failure history live in
+> `docs/micronode-findings.md`; tests are `micronode_chisel/test.lua`
+> (in-engine) and `tools/headless_qc.py` (CI).
+
 ---
 
 ## Summary
@@ -84,6 +92,10 @@ Successfully implemented **Vintage Story-style micronode chiseling** for Luanti 
 - **Left click:** Chisel block (convert to micronode) / Add micronodes
 - **Right click:** Remove micronodes
 - **Sneak + Left:** Cycle grid size (1/16, 1/8, 1/4, 1/2, 1/1)
+- **Right-click in air:** Open the chisel size menu (`/mn_menu`)
+- **Sneak + Aux1 + Left / Right:** Copy / paste a chiseled block (`/mn_copy`, `/mn_paste`)
+- **Carving a block fully empty:** removes the node instead of leaving an invisible one
+- **Pushing a face on the node border:** places the neighbouring node, costing one node in survival
 - **Sneak + Right:** Cycle material slot (1-4)
 - **Aux1 (E) + Left:** Rotate block 90°
 - **Right click (secondary):** Show block info
