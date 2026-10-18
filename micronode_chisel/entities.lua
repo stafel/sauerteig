@@ -112,10 +112,12 @@ local function face_textures(tex, box)
 	}
 end
 
+local FACE_EPSILON = 1 / 64
+
 local function spawn_box(pos, box, texture)
-	local sx = math.max(box.x1 - box.x0, 0.001)
-	local sy = math.max(box.y1 - box.y0, 0.001)
-	local sz = math.max(box.z1 - box.z0, 0.001)
+	local sx = math.max(box.x1 - box.x0, FACE_EPSILON)
+	local sy = math.max(box.y1 - box.y0, FACE_EPSILON)
+	local sz = math.max(box.z1 - box.z0, FACE_EPSILON)
 	-- Entity sits at the box center; the cube visual extends +/- size/2
 	local center = vector.add(pos, vector.new(
 		(box.x0 + box.x1) / 2 + 0.5,
@@ -173,7 +175,8 @@ function M.update_block_mesh(pos)
 
 	M.remove_block_entities(pos)
 
-	local boxes = M.generate_optimized_nodeboxes(block_data.grid, block_data.palette)
+	local sides = solid_outside_sides(pos)
+	local boxes = M.generate_surface_faces(block_data.grid, block_data.palette, sides)
 
 	if #boxes == 0 then
 		return

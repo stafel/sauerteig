@@ -234,4 +234,128 @@ function M.get_nodebox_list(grid, palette)
 	return nodeboxes
 end
 
+------------------------------------------------------------------------------
+-- Surface-Only Meshing (Cube 2 / Sauerbraten style)
+------------------------------------------------------------------------------
+-- Sauerbraten renders only the *exposed* faces of its octree, merged into
+-- large coplanar rectangles. We do the same for the 16^3 micronode grid:
+-- a rectangle is emitted only where a solid micronode is adjacent to air,
+-- greedily merged per plane and material. No interior geometry, no
+-- overlapping solid boxes, no z-fighting.
+--
+-- solid_outside: {px, nx, py, ny, pz, nz} — whether the neighboring Luanti
+-- node on that side is solid. Faces against solid neighbors are never
+-- visible and are culled.
+--
+-- Returns rects: {x0,y0,z0,x1,y1,z1 (nodebox coords, paper-thin on the face
+-- plane), material = node name}.
+
+function M.generate_surface_faces(grid, palette, solid_outside)
+	local R = M.RESOLUTION
+	local rects = {}
+
+	local function nb0(c) return (c - 1) / R - 0.5 end
+	local function nb1(c) return c / R - 0.5 end
+
+	-- axis: 1 = x, 2 = y, 3 = z; slice s along the axis, (u, v) in-plane
+	local function voxel_at(axis, s, u, v)
+		if axis == 1 then return s, u, v end
+		if axis == 2 then return u, s, v end
+		return u, v, s
+	end
+
+	local function outside_key(axis, dir)
+		if axis == 1 then return dir > 0 and "px" or "nx" end
+		if axis == 2 then return dir > 0 and "py" or "ny" end
+		return dir > 0 and "pz" or "nz"
+	end
+
+	for axis = 1, 3 do
+		for _, dir in ipairs({-1, 1}) do
+			for s = 1, R do
+				-- exposed[mask] per material, 0 = not exposed
+				local mask, visited = {}, {}
+				for u = 1, R do
+					mask[u], visited[u] = {}, {}
+					for v = 1, R do
+						local x, y, z = voxel_at(axis, s, u, v)
+						local mat = M.get_voxel(grid, x, y, z)
+						visited[u][v] = false
+						mask[u][v] = 0
+						if mat > 0 then
+							local nx, ny, nz = x, y, z
+							if axis == 1 then nx = x + dir
+							elseif axis == 2 then ny = y + dir
+							else nz = z + dir end
+							local open
+							if nx >= 1 and nx <= R and ny >= 1 and ny <= R
+								and nz >= 1 and nz <= R then
+								open = M.get_voxel(grid, nx, ny, nz) == 0
+							else
+								-- solid_outside[key] is true when the
+								-- neighboring Luanti node is NOT walkable
+								open = solid_outside == nil
+									or solid_outside[outside_key(axis, dir)] == true
+							end
+							local material = M.palette_get(palette, mat)
+							if open and material and material ~= "air" then
+								mask[u][v] = mat
+							end
+						end
+					end
+				end
+
+				-- greedy rectangle merge over the exposed mask
+				for u = 1, R do
+					for v = 1, R do
+						local mat = mask[u][v]
+						if mat > 0 and not visited[u][v] then
+							local v2 = v
+							while v2 < R and mask[u][v2 + 1] == mat
+								and not visited[u][v2 + 1] do
+								v2 = v2 + 1
+							end
+							local u2 = u
+							local can_extend = true
+							while u2 < R and can_extend do
+								for vv = v, v2 do
+									if mask[u2 + 1][vv] ~= mat or visited[u2 + 1][vv] then
+										can_extend = false
+										break
+									end
+								end
+								if can_extend then u2 = u2 + 1 end
+							end
+							for uu = u, u2 do
+								for vv = v, v2 do
+									visited[uu][vv] = true
+								end
+							end
+							-- paper-thin box on the face plane
+							local plane = dir > 0 and nb1(s) or nb0(s)
+							local rect = nil
+							if axis == 1 then
+								rect = {x0 = plane, x1 = plane,
+									y0 = nb0(u), y1 = nb1(u2),
+									z0 = nb0(v), z1 = nb1(v2)}
+							elseif axis == 2 then
+								rect = {y0 = plane, y1 = plane,
+									x0 = nb0(u), x1 = nb1(u2),
+									z0 = nb0(v), z1 = nb1(v2)}
+							else
+								rect = {z0 = plane, z1 = plane,
+									x0 = nb0(u), x1 = nb1(u2),
+									y0 = nb0(v), y1 = nb1(v2)}
+							end
+							rect.material = M.palette_get(palette, mat)
+							table.insert(rects, rect)
+						end
+					end
+				end
+			end
+		end
+	end
+	return rects
+end
+
 print("[micronode_chisel] Rendering loaded")

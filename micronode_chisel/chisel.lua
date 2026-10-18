@@ -219,26 +219,66 @@ end
 -- Map the exact look-ray hit on a block face to micronode coordinates
 -- (1..M.RESOLUTION). pointed_thing only carries integer node positions, so
 -- raycast from the player's eye to obtain the precise intersection point.
-local function face_hit_to_micronode(pos, player, pointed)
+-- Voxel DDA picking through the block's 16^3 micronode grid (Cube 2 style:
+-- the edit lands on the exact micronode surface under the cursor).
+-- Returns: mx, my, mz (solid micronode hit), fx, fy, fz (face normal axis
+-- signs: the air side the ray entered from)
+local function pick_micronode(pos, player, grid)
 	local eye = vector.add(player:get_pos(), vector.new(0, 1.475, 0))
-	local ray_end = vector.add(eye, vector.multiply(player:get_look_dir(), 8))
-	local ray = core.raycast(eye, ray_end, false, false)
-	for hit in ray do
-		if hit.type == "node" and vector.equals(hit.under, pos) then
-			local o = vector.subtract(hit.intersection_point, pos)
-			return M.offset_to_micronode(
-				math.max(0, math.min(1, o.x)),
-				math.max(0, math.min(1, o.y)),
-				math.max(0, math.min(1, o.z)))
-		end
+	local dir = player:get_look_dir()
+	local origin = vector.subtract(eye, pos)  -- block-relative
+
+	local R = M.RESOLUTION
+	-- normalize to voxel space
+	local o = vector.multiply(origin, R)
+	local d = vector.multiply(dir, 0.000001)
+	d = vector.multiply(dir, R)
+
+	-- current voxel (may be outside the block; clamp/DDA will handle it)
+	local cx = math.floor(o.x) + 1
+	local cy = math.floor(o.y) + 1
+	local cz = math.floor(o.z) + 1
+
+	local step = vector.new(
+		d.x > 0 and 1 or -1,
+		d.y > 0 and 1 or -1,
+		d.z > 0 and 1 or -1)
+
+	local function side_dist(c, dc, sc)
+		if dc == 0 then return math.huge end
+		local edge = sc > 0 and c or c + 1
+		return (edge - c) / dc
 	end
-	-- Fallback: middle of the pointed face
-	local d = vector.subtract(pointed.above, pos)
-	local o = vector.multiply(d, 0.5)
-	return M.offset_to_micronode(
-		math.max(0, math.min(1, o.x)),
-		math.max(0, math.min(1, o.y)),
-		math.max(0, math.min(1, o.z)))
+
+	local tx = side_dist(cx, d.x, step.x)
+	local ty = side_dist(cy, d.y, step.y)
+	local tz = side_dist(cz, d.z, step.z)
+
+	local max_steps = 256
+	for _ = 1, max_steps do
+		-- inside the block?
+		if cx >= 1 and cx <= R and cy >= 1 and cy <= R and cz >= 1 and cz <= R then
+			if M.get_voxel(grid, cx, cy, cz) > 0 then
+				local fx, fy, fz = 0, 0, 0
+				if tx <= ty and tx <= tz then fx = -step.x
+				elseif ty <= tz then fy = -step.y
+				else fz = -step.z end
+				return cx, cy, cz, fx, fy, fz
+			end
+		end
+		if tx <= ty and tx <= tz then
+			tx = tx + math.abs(1 / d.x)
+			cx = cx + step.x
+		elseif ty <= tz then
+			ty = ty + math.abs(1 / d.y)
+			cy = cy + step.y
+		else
+			tz = tz + math.abs(1 / d.z)
+			cz = cz + step.z
+		end
+		if tx > 1e9 and ty > 1e9 and tz > 1e9 then break end
+	end
+	return nil
 end
 
 -- Chisel Tool Registration
@@ -306,10 +346,11 @@ core.register_tool("micronode_chisel:chisel", {
 			return
 		end
 		do -- add voxels
-			local mx, my, mz = face_hit_to_micronode(pos, user, pointed_thing)
-
-			-- Add material
-			M.edit_micronodes(pos, mx, my, mz, get_grid_size(st), st.material_idx, true)
+			local mx, my, mz, fx, fy, fz = pick_micronode(pos, user, block_grid(pos))
+			if not mx then return end
+			-- Add on the air side of the hit face (Cube 2: edit grows from surface)
+			M.edit_micronodes(pos, mx + fx, my + fy, mz + fz,
+				get_grid_size(st), st.material_idx, true)
 			local info = M.get_block_info(pos)
 			core.chat_send_player(name, string.format(
 				"Added %s micronodes (fill: %.1f%%)",
@@ -348,7 +389,8 @@ core.register_tool("micronode_chisel:chisel", {
 		else
 			return
 		end
-		local mx, my, mz = face_hit_to_micronode(pos, user, pointed_thing)
+		local mx, my, mz = pick_micronode(pos, user, block_grid(pos))
+		if not mx then return end
 
 			M.edit_micronodes(pos, mx, my, mz, get_grid_size(st), 0, false)
 			local info = M.get_block_info(pos)
