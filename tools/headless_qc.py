@@ -48,37 +48,22 @@ def make_runtime():
 
         return Meta()
 
-    core = L.table(
-        registered_nodes={
-            "air": {"walkable": False},
-            "default:stone": {"walkable": True, "tiles": {"default_stone.png"}},
-            "default:sand": {"walkable": True, "tiles": {"default_sand.png"}},
-        },
-        registered_items={"default:stone": {}, "default:sand": {}},
-        get_node=get_node,
-        get_meta=get_meta,
-        register_node=register_node,
-        register_tool=lambda *a, **k: None,
-        register_entity=lambda *a, **k: None,
-        register_lbm=lambda *a, **k: None,
-        register_chatcommand=lambda *a, **k: None,
-        register_privilege=lambda *a, **k: None,
-        register_on_joinplayer=lambda *a, **k: None,
-        register_on_leaveplayer=lambda *a, **k: None,
-        register_on_mods_loaded=lambda *a, **k: None,
-        chat_send_player=lambda *a, **k: None,
-        pos_to_string=lambda p: str(p),
-        log=lambda *a, **k: None,
-        write_json=lambda t: str(t),
-        parse_json=lambda s: None,
-        add_entity=lambda *a, **k: None,
-        get_objects_inside_radius=lambda *a, **k: (),
-        swap_node=lambda *a, **k: None,
-        load_area=lambda *a, **k: None,
-        set_node=lambda *a, **k: None,
-        LIGHT_MAX=14,
-    )
-    L.globals()["core"] = core
+    # Lua-native stubs (Python callables bridge poorly for method-style
+    # calls like meta:get_string). tools/stub.lua is the single source.
+    import os
+    stub_path = os.path.join(os.path.dirname(__file__), "stub.lua")
+    with open(stub_path) as fh:
+        L.execute(fh.read())
+    # dynamic media capture for the entity audit; write_json passes the
+    # table through so the audit can inspect real sizes/textures
+    L.execute(r"""
+    __spawned = {}
+    core.write_json = function(t) return t end
+    core.parse_json = function(s) return s end
+    core.add_entity = function(pos, name, data)
+        table.insert(__spawned, {pos = pos, name = name, raw = data})
+    end
+    """)
 
     # vector stubs (full API surface used by the mod)
     vector_code = r'''
@@ -273,6 +258,65 @@ def check_semantics(L, M):
     ok("crop string format sanity")
 
 
+def check_entity_audit(L, M):
+    """End-to-end: chisel a block, carve a hole, update_block_mesh, and audit
+    every spawned entity: position must equal the box min corner (corner
+    anchor), sizes must equal the (normalized) box extents, and every face
+    texture must be a [combine whose blit actually lands in-canvas."""
+    import lupa
+    # stubs already installed by make_runtime (Lua-native, with meta store
+    # and __spawned capture)
+    pos = L.eval("vector.new(10, 20, 30)")
+    assert M.api_chisel(pos, "default:sand")
+    assert M.api_fill_box(pos, 7, 7, 7, 10, 10, 10, "air")
+    M.update_block_mesh(pos)
+    spawned = L.eval("__spawned")
+    n = len(spawned)
+    if n == 0:
+        fail("entity audit: no entities spawned for carved block")
+        return
+    bad = 0
+    for i in range(1, n + 1):
+        e = spawned[i]
+        p, r = e["pos"], e["raw"]
+        sx, sy, sz = r["sx"], r["sy"], r["sz"]
+        # sizes must be positive multiples of 1/16 (up to float tolerance)
+        for name, v in (("sx", sx), ("sy", sy), ("sz", sz)):
+            if v <= 0 or abs(v * 16 - round(v * 16)) > 1e-6:
+                bad += 1
+                fail(f"entity {i}: invalid {name} = {v}")
+        # position must be the node origin + k/16 offsets
+        for name, v in (("x", p["x"]), ("y", p["y"]), ("z", p["z"])):
+            base = {"x": 10, "y": 20, "z": 30}[name]
+            off = v - base
+            if off < -1e-9 or off > 1 + 1e-9 or abs(off * 16 - round(off * 16)) > 1e-6:
+                bad += 1
+                fail(f"entity {i}: position {name}={v} off-grid (off={off})")
+        # every face texture: [combine:WxH:X,Y=... with blit landing in-canvas
+        texs = r["texs"]
+        for j in range(1, 7):
+            t = str(texs[j])
+            if not t.startswith("[combine:"):
+                bad += 1
+                fail(f"entity {i} tex[{j}]: not a combine: {t}")
+                continue
+            try:
+                dims, rest = t[len("[combine:"):].split(":", 1)
+                w, h = map(int, dims.split("x"))
+                xy, _ = rest.split("=", 1)
+                xs, ys = map(int, xy.split(","))
+            except Exception as ex:
+                bad += 1
+                fail(f"entity {i} tex[{j}]: unparseable combine: {t} ({ex})")
+                continue
+            # blit must land at least partially inside the canvas
+            if xs >= w or ys >= h or xs <= -16 or ys <= -16:
+                bad += 1
+                fail(f"entity {i} tex[{j}]: blit outside canvas: {t}")
+    if bad == 0:
+        ok(f"entity audit: {n} entities, all positions on grid, sizes valid, all 6n face textures in-canvas")
+
+
 def check_strict_globals():
     """Execute each mod file in a fresh runtime with a strict-G metatable
     that raises on reads of undefined globals, catching nil-call bugs."""
@@ -311,6 +355,7 @@ def main():
         sys.exit(1)
     check_semantics(L, M)
     check_spawn_origin(L, M)
+    check_entity_audit(L, M)
     check_strict_globals()
     print()
     if FAILURES:

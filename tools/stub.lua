@@ -5,7 +5,19 @@ core.registered_nodes = { air = {walkable = false},
     ["default:sand"] = {walkable = true, tiles = {"default_sand.png"}} }
 core.registered_items = {}
 function core.get_node(p) return {name = "air"} end
-function core.get_meta(p) return {} end
+__meta_store = {}
+function core.get_meta(p)
+    local key = tostring(p.x) .. "," .. tostring(p.y) .. "," .. tostring(p.z)
+    local store = __meta_store[key]
+    if not store then
+        store = {}
+        __meta_store[key] = store
+    end
+    return {
+        get_string = function(_, k) return store[k] or "" end,
+        set_string = function(_, k, v) store[k] = v end,
+    }
+end
 for _, n in ipairs({"register_node","register_tool","register_entity","register_lbm",
     "register_chatcommand","register_privilege","register_on_joinplayer",
     "register_on_leaveplayer","register_on_mods_loaded"}) do
