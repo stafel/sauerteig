@@ -250,8 +250,8 @@ end
 -- Returns rects: {x0,y0,z0,x1,y1,z1 (nodebox coords, paper-thin on the face
 -- plane), material = node name}.
 
-function M.generate_surface_faces(grid, palette, solid_outside)
-	local R = M.RESOLUTION
+function M.generate_surface_faces(grid, palette, solid_outside, res)
+	local R = res or M.RESOLUTION
 	local rects = {}
 
 	local function nb0(c) return (c - 1) / R - 0.5 end

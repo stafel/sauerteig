@@ -351,4 +351,47 @@ function M.offset_to_micronode(ox, oy, oz)
 	       math.max(1, math.min(M.RESOLUTION, mz))
 end
 
+-- Downsample the voxel grid by an integer factor: each step^3 block of
+-- voxels becomes one voxel (filled if any source voxel is solid). Used by
+-- the progressive-coarsening render path when a shape exceeds the render
+-- entity budget.
+function M.coarsen_grid(grid, step)
+	local R = M.RESOLUTION
+	if step <= 1 then return grid, R end
+	local oR = math.ceil(R / step)
+	local out = {}
+	for z = 1, oR do
+	for y = 1, oR do
+	for x = 1, oR do
+	local solid = 0
+	for dz = 0, step - 1 do
+	local sz = (z - 1) * step + dz + 1
+	if sz > R then break end
+	for dy = 0, step - 1 do
+	local sy = (y - 1) * step + dy + 1
+	if sy > R then break end
+	for dx = 0, step - 1 do
+	local sx = (x - 1) * step + dx + 1
+	if sx > R then break end
+	if M.get_voxel(grid, sx, sy, sz) > 0 then
+	solid = 1
+	break
+	end
+	end
+	if solid > 0 then break end
+	end
+	if solid > 0 then break end
+	end
+	local idx = (z - 1) * oR * oR + (y - 1) * oR + x
+	out[idx] = solid
+	end
+	end
+	end
+	-- pad to oR^3 so get_voxel/count_solid style indexing keeps working
+	for i = 1, oR * oR * oR do
+	if out[i] == nil then out[i] = 0 end
+	end
+	return out, oR
+end
+
 print("[micronode_chisel] Data structures loaded")

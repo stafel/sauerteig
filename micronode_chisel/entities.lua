@@ -195,25 +195,31 @@ function M.update_block_mesh(pos)
 	M.remove_block_entities(pos)
 
 	local sides = solid_outside_sides(pos)
-	local boxes = M.generate_surface_faces(block_data.grid, block_data.palette, sides)
 
-	if #boxes == 0 then
-		return
-	end
-
-	if #boxes > M.MAX_RENDER_BOXES then
-		-- Too complex for the entity budget: render one solid box covering
-		-- the block (collision is already full-block in v1).
-		core.log("warning", "[micronode_chisel] " .. core.pos_to_string(pos)
-			.. ": " .. #boxes .. " boxes exceeds render budget, using full block")
-		spawn_box(pos,
-			{x0 = -0.5, y0 = -0.5, z0 = -0.5, x1 = 0.5, y1 = 0.5, z1 = 0.5},
-			M.get_texture(block_data.base))
-		return
-	end
-
-	for _, box in ipairs(boxes) do
-		spawn_box(pos, box, M.get_texture(box.material))
+	-- Progressive coarsening: try full resolution first; if the merged
+	-- surface needs more entities than the render budget allows, re-mesh
+	-- with coarser (uniformly filled) voxel blocks so the shape stays
+	-- recognizable instead of snapping back to a full block.
+	for _, step in ipairs({1, 2, 4, 8, 16}) do
+		local grid, res = block_data.grid, M.RESOLUTION
+		if step > 1 then
+			grid, res = M.coarsen_grid(block_data.grid, step)
+		end
+		local boxes = M.generate_surface_faces(grid, block_data.palette, sides, res)
+		if #boxes == 0 then
+			return
+		end
+		if #boxes <= M.MAX_RENDER_BOXES or step == 16 then
+			if step > 1 then
+				core.log("action", "[micronode_chisel] " .. core.pos_to_string(pos)
+					.. ": rendering at 1/" .. step .. " resolution ("
+					.. #boxes .. " faces)")
+			end
+			for _, box in ipairs(boxes) do
+				spawn_box(pos, box, M.get_texture(box.material))
+			end
+			return
+		end
 	end
 end
 
