@@ -83,6 +83,25 @@ end
 -- is centered on the entity position. Each face maps its whole texture, so
 -- textures must be cropped to the box's proportional region of the base
 -- texture (like nodebox UV mapping does) to avoid stretching/warping.
+-- Whether the Luanti nodes adjacent to the block are walkable; faces
+-- against solid neighbors are never visible and can be culled.
+-- Returns a table of {px, nx, py, ny, pz, nz} = true when that side is
+-- OPEN (neighbor not walkable).
+local function solid_outside_sides(pos)
+	local sides = {}
+	local defs = {
+		px = { 1, 0, 0}, nx = {-1, 0, 0},
+		py = { 0, 1, 0}, ny = { 0,-1, 0},
+		pz = { 0, 0, 1}, nz = { 0, 0,-1},
+	}
+	for key, d in pairs(defs) do
+		local npos = vector.add(pos, vector.new(d[1], d[2], d[3]))
+		local ndef = core.registered_nodes[core.get_node(npos).name]
+		sides[key] = not (ndef and ndef.walkable)
+	end
+	return sides
+end
+
 local function crop_16(tex, u0, v0, u1, v1)
 	-- Normalize to 16px so the crop is texture-pack agnostic
 	local base = tex .. "^[resize:16x16"

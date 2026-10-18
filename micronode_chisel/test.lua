@@ -362,7 +362,8 @@ end
 ------------------------------------------------------------------------------
 
 local function test_entity_rendering()
-	local pos = vector.new(0, 40, 0)
+	-- Far from spawn so the test block can never trap/kill a spawning player
+	local pos = vector.new(80, 80, 80)
 	core.load_area(pos)
 
 	-- Place a solid stone node
@@ -410,8 +411,8 @@ local function test_entity_rendering()
 	log_test("entity_cleanup", pass,
 		string.format("Fully-carved block has %d entities (expected 0)", count))
 
-	-- Restore the area
-	core.set_node(pos, {name = stone})
+	-- Clean up: the test placed this node, restore it to air
+	core.set_node(pos, {name = "air"})
 
 	return pass
 end
