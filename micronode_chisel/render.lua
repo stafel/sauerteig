@@ -99,6 +99,44 @@ end
 -- Block mesh rebuild
 -------------------------------------------------------------------------------
 
+-- Coarsening factors tried when a block exceeds the entity budget. The
+-- fallback is a last resort: it must degrade detail, never inflate the shape
+-- (see M.coarsen_grid).
+M.COARSEN_STEPS = {2, 4, 8}
+
+-- Build the box list for one block within an entity budget.
+-- Returns boxes, coarsening_step. Step 1 means full resolution. If even the
+-- coarsest non-empty downsample is over budget, the smallest list is used; if
+-- majority coarsening erases a thin shape entirely, the full-resolution list
+-- is kept rather than rendering nothing (an invisible block is worse than a
+-- dense one).
+function M.render_boxes(pos, block, budget)
+	local neighbors = M.build_neighbors(pos)
+	local full = M.build_surface_boxes(block.grid, block.palette, neighbors, R)
+	if #full <= budget then
+		return full, 1
+	end
+
+	local best, best_step, best_count
+	for _, step in ipairs(M.COARSEN_STEPS) do
+		local coarse, res = M.coarsen_grid(block.grid, step, R)
+		if not M.is_empty(coarse) then
+			local boxes = M.build_surface_boxes(coarse, block.palette,
+				M.build_neighbors(pos, step), res)
+			if #boxes <= budget then
+				return boxes, step
+			end
+			if not best or #boxes < best_count then
+				best, best_step, best_count = boxes, step, #boxes
+			end
+		end
+	end
+	if best then
+		return best, best_step
+	end
+	return full, 1
+end
+
 -- Rebuild the visible geometry of one block. Cheap no-op when the shape is
 -- unchanged and its entities are still alive.
 function M.update_block_mesh(pos)
@@ -108,24 +146,13 @@ function M.update_block_mesh(pos)
 		return
 	end
 
-	local neighbors = M.build_neighbors(pos)
 	local budget = M.render_budget()
-	local boxes = M.build_surface_boxes(block.grid, block.palette, neighbors, R)
+	local boxes, step = M.render_boxes(pos, block, budget)
 
-	if #boxes > budget then
-		-- Emergency path: re-mesh a conservative (any-solid) downsample of the
-		-- shape so the block stays closed and recognizable instead of flooding
-		-- the world with entities or snapping back to a full cube.
-		for _, step in ipairs({2, 4, 8}) do
-			local coarse, res = M.coarsen_grid(block.grid, step, R)
-			local coarse_boxes = M.build_surface_boxes(coarse, block.palette, neighbors, res)
-			if #coarse_boxes <= budget then
-				boxes = coarse_boxes
-				core.log("action", "[micronode_chisel] " .. core.pos_to_string(pos)
-					.. ": rendering " .. #boxes .. " faces at 1/" .. step .. " resolution")
-				break
-			end
-		end
+	if step > 1 then
+		core.log("action", "[micronode_chisel] " .. core.pos_to_string(pos)
+			.. ": rendering " .. #boxes .. " faces at 1/" .. step
+			.. " resolution (raise micronode_chisel.max_render_boxes for full detail)")
 	end
 
 	local hash = M.boxes_hash(boxes)

@@ -13,7 +13,10 @@
 -- Depth stays well below one micronode: at a full-voxel depth, a one-voxel
 -- thick feature (a shelf, a wall) produces two boxes whose *inner* planes
 -- coincide exactly. Surface planes are always >= 1/RESOLUTION apart, so a
--- quarter-voxel depth can never coincide with another surface.
+-- quarter-micronode depth can never coincide with another surface. This is an
+-- absolute thickness, not a fraction of a coarse cell: the render-budget
+-- fallback meshes at 1/2, 1/4 or 1/8 resolution and its boxes still have to
+-- avoid the surface planes of full-resolution neighbours.
 --
 -- Coplanar overlap between *side* quads is handled on the render side: only the
 -- outward face of each box is drawn, the other five are discarded
@@ -116,7 +119,9 @@ end
 function M.build_surface_boxes(grid, palette, neighbors, res)
 	res = res or R
 	local boxes = {}
-	local depth = (1 / res) * M.FACE_DEPTH_FRACTION
+	-- Absolute thickness (quarter of a full-resolution micronode), independent
+	-- of the mesh resolution; see the header.
+	local depth = (1 / math.max(res, R)) * M.FACE_DEPTH_FRACTION
 
 	for _, side in ipairs(SIDES) do
 		local axis, dir = side.axis, side.dir

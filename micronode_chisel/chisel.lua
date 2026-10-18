@@ -5,22 +5,22 @@
 --   left click on a chiseled block -> push: add a grid-thick layer on the face
 --   right click on a chiseled block -> pull: carve a grid-thick layer inwards
 --   sneak + left                 -> cycle grid step (1 2 4 8 16 micronodes)
+--   right click in air           -> open the size menu (buttons, discoverable)
 --   sneak + right                -> pick the material of the targeted node, or
 --                                   cycle the palette of a chiseled block
 --   aux1 + left / aux1 + right   -> rotate 90 deg / flip the block
+--
+-- The grid step is per player, applied to the brush (both the layer thickness
+-- and the in-plane extent), and persisted in player metadata so it survives a
+-- reconnect.
 
 local M = micronode_chisel
 
-local state = {}
+local META_GRID_INDEX = "micronode_chisel:grid_index"
+local META_MATERIAL = "micronode_chisel:material"
+local SIZE_FORMNAME = "micronode_chisel:size"
 
-local function get_state(name)
-	local st = state[name]
-	if not st then
-		st = {grid_idx = 1, material = nil, palette_idx = 0}
-		state[name] = st
-	end
-	return st
-end
+local state = {}
 
 local function grid_size(st)
 	return M.GRID_SIZES[st.grid_idx] or 1
@@ -28,6 +28,114 @@ end
 
 local function tell(name, text)
 	core.chat_send_player(name, "[chisel] " .. text)
+end
+
+local function grid_label(idx)
+	return M.GRID_NAMES[idx] .. " (" .. M.GRID_SIZES[idx] .. " micronodes)"
+end
+
+-- Player metadata is optional: tests and non-player callers do not have it.
+local function save_state(name)
+	local st = state[name]
+	local player = core.get_player_by_name and core.get_player_by_name(name)
+	if not st or not player or not player.get_meta then
+		return
+	end
+	local meta = player:get_meta()
+	meta:set_string(META_GRID_INDEX, tostring(st.grid_idx))
+	meta:set_string(META_MATERIAL, st.material or "")
+end
+
+local function get_state(name)
+	local st = state[name]
+	if st then
+		return st
+	end
+	st = {grid_idx = 1, material = nil, palette_idx = 0}
+	local player = core.get_player_by_name and core.get_player_by_name(name)
+	if player and player.get_meta then
+		local meta = player:get_meta()
+		local idx = tonumber(meta:get_string(META_GRID_INDEX))
+		if idx and M.GRID_SIZES[idx] then
+			st.grid_idx = idx
+		end
+		local material = meta:get_string(META_MATERIAL)
+		if material and material ~= "" then
+			st.material = material
+		end
+	end
+	state[name] = st
+	return st
+end
+
+-------------------------------------------------------------------------------
+-- Grid-step selection (also used by tests and other mods)
+-------------------------------------------------------------------------------
+
+function M.player_grid_index(name)
+	return get_state(name).grid_idx
+end
+
+function M.player_grid_size(name)
+	return grid_size(get_state(name))
+end
+
+-- Set the step by micronode count (1, 2, 4, 8, 16). Returns false when the
+-- value is not one of the supported steps.
+function M.set_player_grid_size(name, step)
+	for idx, size in ipairs(M.GRID_SIZES) do
+		if size == step then
+			get_state(name).grid_idx = idx
+			save_state(name)
+			return true
+		end
+	end
+	return false
+end
+
+-- Cycle the step (delta=1 follows the 1 -> 2 -> 4 -> 8 -> 16 -> 1 order).
+function M.cycle_player_grid(name, delta)
+	local st = get_state(name)
+	local count = #M.GRID_SIZES
+	st.grid_idx = ((st.grid_idx - 1 + (delta or 1)) % count) + 1
+	save_state(name)
+	return st.grid_idx
+end
+
+function M.set_player_material(name, material)
+	get_state(name).material = material
+	save_state(name)
+end
+
+-------------------------------------------------------------------------------
+-- Size menu
+-------------------------------------------------------------------------------
+-- Opened by right-clicking air. The sneaking key combos stay available, but
+-- this makes the sizes visible and clickable instead of hidden behind a
+-- gesture (the earlier implementation only exposed them that way).
+
+function M.show_size_menu(player)
+	local name = player:get_player_name()
+	local st = get_state(name)
+	local parts = {
+		"formspec_version[4]",
+		"size[8.6,5.2]",
+		"label[0.4,0.3;Chisel size]",
+	}
+	local x = 0.4
+	for idx, label in ipairs(M.GRID_NAMES) do
+		local marked = (idx == st.grid_idx) and " *" or ""
+		parts[#parts + 1] = string.format(
+			"button[%.2f,0.8;1.55,0.9;size_%d;%s%s]",
+			x, idx, label, marked)
+		x = x + 1.6
+	end
+	parts[#parts + 1] = "label[0.4,2.0;1/16 = one micronode (6.25 cm), 1/1 = the whole node]"
+	parts[#parts + 1] = "label[0.4,2.5;Material: " .. tostring(st.material or "(surface or picked)") .. "]"
+	parts[#parts + 1] = "label[0.4,3.0;Left click: push / chisel.  Right click: carve.]"
+	parts[#parts + 1] = "label[0.4,3.5;Sneak+Left on a block still cycles the size.]"
+	parts[#parts + 1] = "button_exit[2.8,4.2;3,0.7;close;Close]"
+	core.show_formspec(name, SIZE_FORMNAME, table.concat(parts))
 end
 
 -- The tool is the instrument, the `chisel` privilege is the permission.
@@ -119,12 +227,13 @@ core.register_node(M.BLOCK_NODE_OPEN, container_def("Chiseled Block (open)", fal
 core.register_tool("micronode_chisel:chisel", {
 	description = "Micronode Chisel\n" ..
 		"Left: chisel block / push material\n" ..
-		"Right: pull (carve) material\n" ..
-		"Sneak+Left: grid step\n" ..
+		"Right: carve material\n" ..
+		"Right-click air: size menu\n" ..
+		"Sneak+Left: cycle size\n" ..
 		"Sneak+Right: pick or cycle material\n" ..
 		"Aux1+Left: rotate, Aux1+Right: flip",
 	inventory_image = "micronode_chisel_chisel.png",
-	groups = {chisel = 1, not_in_creative_inventory = 1},
+	groups = {chisel = 1},
 
 	on_use = function(itemstack, user, pointed_thing)
 		if not user or not user:is_player() then
@@ -144,9 +253,8 @@ core.register_tool("micronode_chisel:chisel", {
 		end
 
 		if ctrl.sneak then
-			st.grid_idx = (st.grid_idx % #M.GRID_SIZES) + 1
-			tell(name, "Grid step: " .. M.GRID_NAMES[st.grid_idx]
-				.. " (" .. grid_size(st) .. " micronodes)")
+			M.cycle_player_grid(name, 1)
+			tell(name, "Grid step: " .. grid_label(M.player_grid_index(name)))
 			return
 		end
 
@@ -169,19 +277,33 @@ core.register_tool("micronode_chisel:chisel", {
 				tell(name, "This node cannot be chiseled")
 				return
 			end
-			st.material = block.base
+			M.set_player_material(name, block.base)
 			M.refresh_block(pos)
-			tell(name, "Chiseled " .. block.base
-				.. " - left adds, right carves, sneak+left changes the grid step")
+			tell(name, "Chiseled " .. block.base .. " (size "
+				.. grid_label(M.player_grid_index(name)) .. ")"
+				.. " - left adds, right carves, right-click air opens the size menu")
 			return
 		end
 
 		local ok, info = M.edit_at(user, pos, "push", grid_size(st), st.material)
 		if ok then
-			tell(name, "Pushed (" .. info .. " block touched)")
+			tell(name, "Pushed " .. grid_label(M.player_grid_index(name))
+				.. " (" .. info .. " block touched)")
 		else
 			tell(name, tostring(info))
 		end
+	end,
+
+	-- Right-click in air opens the size menu. Pointing at a node goes through
+	-- on_place instead, so this does not steal the push/pull verbs.
+	on_secondary_use = function(itemstack, user)
+		if not user or not user:is_player() then
+			return itemstack
+		end
+		local name = user:get_player_name()
+		M.show_size_menu(user)
+		tell(name, "Current size: " .. grid_label(M.player_grid_index(name)))
+		return itemstack
 	end,
 
 	on_place = function(itemstack, user, pointed_thing)
@@ -210,7 +332,7 @@ core.register_tool("micronode_chisel:chisel", {
 						st.palette_idx = (st.palette_idx % M.MAX_MATERIALS) + 1
 						local candidate = M.palette_get(block.palette, st.palette_idx)
 						if not M.is_air_name(candidate) then
-							st.material = candidate
+							M.set_player_material(name, candidate)
 							break
 						end
 					end
@@ -219,7 +341,7 @@ core.register_tool("micronode_chisel:chisel", {
 			else
 				local picked = core.get_node(pos).name
 				if not M.is_air_name(picked) then
-					st.material = picked
+					M.set_player_material(name, picked)
 					tell(name, "Material: " .. picked)
 				end
 			end
@@ -238,7 +360,8 @@ core.register_tool("micronode_chisel:chisel", {
 		if M.is_micronode_block(pos) then
 			local ok, info = M.edit_at(user, pos, "pull", grid_size(st), nil)
 			if ok then
-				tell(name, "Carved (" .. info .. " block touched)")
+				tell(name, "Carved " .. grid_label(M.player_grid_index(name))
+					.. " (" .. info .. " block touched)")
 			else
 				tell(name, tostring(info))
 			end
@@ -246,6 +369,24 @@ core.register_tool("micronode_chisel:chisel", {
 		return itemstack
 	end,
 })
+
+-- Size menu clicks. Re-rendering the menu after a click keeps the active step
+-- visible without closing and reopening it.
+core.register_on_player_receive_fields(function(player, formname, fields)
+	if formname ~= SIZE_FORMNAME then
+		return false
+	end
+	local name = player:get_player_name()
+	for idx = 1, #M.GRID_SIZES do
+		if fields["size_" .. idx] then
+			get_state(name).grid_idx = idx
+			save_state(name)
+			M.show_size_menu(player)
+			return true
+		end
+	end
+	return false
+end)
 
 -------------------------------------------------------------------------------
 -- Commands
@@ -267,22 +408,74 @@ core.register_chatcommand("chisel", {
 	end,
 })
 
+core.register_chatcommand("mn_menu", {
+	params = "",
+	description = "Open the chisel size menu",
+	func = function(name)
+		local player = core.get_player_by_name(name)
+		if not player then
+			return false, "Player not found"
+		end
+		M.show_size_menu(player)
+		return true, "Current size: " .. grid_label(M.player_grid_index(name))
+	end,
+})
+
 core.register_chatcommand("mn_grid", {
 	params = "[step]",
-	description = "Show or set the chisel grid step (1, 2, 4, 8 or 16 micronodes)",
+	description = "Show or set the chisel grid step (1, 2, 4, 8, 16 micronodes or 1/16 .. 1/1)",
 	func = function(name, param)
-		local st = get_state(name)
-		local step = tonumber(param)
-		if step then
-			for idx, size in ipairs(M.GRID_SIZES) do
-				if size == step then
-					st.grid_idx = idx
-					break
+		if param and param ~= "" then
+			local step = tonumber(param)
+			if not step then
+				for idx, label in ipairs(M.GRID_NAMES) do
+					if label == param then
+						step = M.GRID_SIZES[idx]
+						break
+					end
 				end
 			end
+			if not step or not M.set_player_grid_size(name, step) then
+				return false, "Grid step must be 1, 2, 4, 8, 16 or 1/16, 1/8, 1/4, 1/2, 1/1"
+			end
 		end
-		return true, "Grid step: " .. M.GRID_NAMES[st.grid_idx]
-			.. " (" .. grid_size(st) .. " micronodes)"
+		return true, "Grid step: " .. grid_label(M.player_grid_index(name))
+	end,
+})
+
+local function budget_label()
+	local budget = M.render_budget()
+	if budget == math.huge then
+		return "unlimited"
+	end
+	return tostring(budget)
+end
+
+core.register_chatcommand("mn_budget", {
+	params = "[boxes]",
+	description = "Show or set the per-block render box budget (0 = unlimited)",
+	func = function(name, param)
+		if core.check_player_privs
+			and not core.check_player_privs(name, {server = true}) then
+			return false, "You need the 'server' privilege"
+		end
+		if not param or param == "" then
+			return true, "Render budget: " .. budget_label()
+				.. " boxes/block (0 = unlimited)"
+		end
+		local value = tonumber(param)
+		if not value or value < 0 then
+			return false, "Budget must be a number >= 0 (0 = unlimited)"
+		end
+		if not core.settings then
+			return false, "No settings available on this server"
+		end
+		core.settings:set("micronode_chisel.max_render_boxes",
+			tostring(math.floor(value)))
+		local refreshed = M.refresh_all_rendered()
+		return true, "Render budget: " .. budget_label()
+			.. " boxes/block for this session; re-meshed " .. refreshed
+			.. " block(s). Set micronode_chisel.max_render_boxes in minetest.conf to persist."
 	end,
 })
 
@@ -295,7 +488,7 @@ core.register_chatcommand("mn_material", {
 			if not core.registered_nodes[param] then
 				return false, "Unknown node: " .. param
 			end
-			st.material = param
+			M.set_player_material(name, param)
 		end
 		return true, "Material: " .. tostring(st.material or "(surface material)")
 	end,
@@ -366,12 +559,15 @@ core.register_on_joinplayer(function(player)
 	local inv = player:get_inventory()
 	if inv and not inv:contains_item("main", "micronode_chisel:chisel") then
 		inv:add_item("main", "micronode_chisel:chisel")
-		tell(name, "Chisel added. Left click a block to chisel it.")
+		tell(name, "Chisel added. Left click a block to chisel it, right-click air for the size menu.")
 	end
+	tell(name, "Chisel size: " .. grid_label(M.player_grid_index(name))
+		.. " - sneak+left or right-click air changes it.")
 end)
 
 core.register_on_leaveplayer(function(player)
 	local name = player:get_player_name()
+	save_state(name)
 	state[name] = nil
 	M.forget_player(name)
 end)

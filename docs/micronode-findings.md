@@ -71,6 +71,11 @@ Sauerbraten's editing feel comes from three properties, replicated here:
 3. **Grid-snapped edits.** The brush is snapped to the active grid step
    (1, 2, 4, 8, 16 micronodes) around the hit cell
    (`edit.lua: M.push_brush` / `M.pull_brush`) — Sauerbraten's `gridpower`.
+   The step is per player and selects both layer thickness and in-plane
+   extent. It is persisted in player metadata and reachable from the tool
+   description, `sneak+left` on a block, `/mn_grid`, and the size menu opened
+   by right-clicking air (`/mn_menu`). Do not remove the menu: the key combo
+   alone made the feature effectively undiscoverable.
 
 ### Modules
 
@@ -82,7 +87,7 @@ Sauerbraten's editing feel comes from three properties, replicated here:
 | `edit.lua` | block access, DDA picking, brushes, region application, undo |
 | `entities.lua` | render entity lifecycle (cube visual, centered transform) |
 | `render.lua` | face texture crops, per-block rebuild, mapblock LBM |
-| `chisel.lua` | container nodes, chisel tool, chat commands |
+| `chisel.lua` | container nodes, chisel tool, per-player size/material state, size menu, chat commands |
 | `api.lua` | public API for other mods |
 
 ### Coordinate spaces
@@ -116,7 +121,10 @@ interpenetrate slightly at shared edges.
 Depth must stay well below one micronode: at a full-voxel depth, a one-voxel
 thick feature (a shelf, a wall) produces two boxes whose *inner* planes
 coincide exactly, which z-fights. Surface planes are always ≥ 1/RESOLUTION
-apart, so a quarter-voxel depth can never coincide with another surface.
+apart, so a quarter-micronode depth can never coincide with another surface.
+The depth is an **absolute** quarter micronode, not a quarter of a mesh cell:
+the render fallback meshes at 1/2, 1/4 or 1/8 resolution, and its slabs still
+have to avoid full-resolution surface planes in neighbouring blocks.
 
 Seams between perpendicular faces are *not* what the extrusion fixes — exact
 math already makes the faces share edges. The historical "split up parts" look
@@ -166,6 +174,31 @@ axis 3 (z faces): u = x, v = y
 Unloaded ("ignore") neighbours are treated as **open**, so a block never shows
 a hole while the neighbouring mapblock is not loaded.
 
+### Render budget and the coarsening fallback
+
+One entity per merged face is the only per-instance geometry the engine offers,
+so a block has an entity budget: `micronode_chisel.max_render_boxes`
+(default **512**, `0` = unlimited). The default used to be 96, which ordinary
+carved shapes exceeded; the fallback then made the block look like a full cube
+again (see §5). `/mn_budget <boxes>` changes the limit for the running server
+(requires the `server` privilege) and re-meshes the blocks already rendered;
+put the setting in `minetest.conf` to persist it.
+
+When a block is over budget, `render.lua: M.render_boxes` re-meshes a
+downsample (`M.coarsen_grid`) at factor 2, 4 or 8, using neighbour masks read
+at the same stride (`edit.lua: M.build_neighbors(pos, step)`). Rules:
+
+- **Majority, ties to air, never "any".** "Any-solid" is watertight but fills
+  every cavity thinner than a coarse cell, which is exactly the "the node
+  turned back into a full block" symptom. Strict majority can lose details
+  smaller than a coarse cell, but it cannot invent a solid mass out of a
+  mostly-empty region.
+- **Never render nothing.** If majority coarsening erases a genuinely thin
+  shape, the full-resolution list is used even if it is over budget. An
+  invisible block is worse than a dense one.
+- The metadata is never touched by the fallback: coarsening is a render-only
+  level of detail, and the next edit/LBM re-derives from the full grid.
+
 ### Texture crops
 
 A cube face maps its whole texture, so each face gets a crop of the material
@@ -213,6 +246,7 @@ half → the remaining slab's face; empty grid → nil.
 | Textures stretched/warped | Cube visual maps the whole texture per face; no crop (§3) |
 | Open sides / invisible block | `[combine` blit offsets positive instead of negative, or a reversed extent making the region land outside the canvas |
 | Node "refills" at ~12% chiseled | Render-budget fallback spawned one full-block box. The fallback now re-meshes a conservative downsample, never a hull |
+| **Chiselled block looked like a full node again after continued carving** | The 96-box render budget was reached and the fallback downsampled with "any-solid", which filled every cavity wall thinner than a coarse cell. Fixed by a 512 default, strict-majority downsampling (ties to air) and coarse neighbour masks. The old fallback also read the neighbour masks at the 16³ stride |
 | Block rendered as "split up parts" | Paper-thin quads *plus* the transform bug: the displacement was read as a seam problem and "fixed" by extruding a full voxel, which reintroduced z-fighting on thin features (§3) |
 | Rest of node invisible + floating top | Coarse grid read with the 16³ stride (§2) |
 | Startup crash ×3 (`solid_outside_sides`, `block_grid`, `voxel` nil) | Multi-step patch scripts: a later step failed after earlier steps had landed, leaving orphaned references |
@@ -243,7 +277,11 @@ half → the remaining slab's face; empty grid → nil.
   - the **z-fighting invariant**: no two drawn quads may be coplanar with
     overlapping area, checked on a full block, a staircase, a cavity, a corner
     carve and a one-voxel shelf,
-  - render-budget coarsening,
+  - render-budget coarsening (strict-majority rule, no refill, cavity survives,
+    checkerboard does not collapse, budget path never renders nothing),
+  - grid-step selection and that the selected step really changes a pushed
+    volume (1³ vs 4³),
+  - neighbour masks at both the full and the coarse stride,
   - DDA picking and brush regions,
   - the **render audit**: chisel → carve → re-mesh, then verify every entity
     sits at its box center with the exact box size, inside the node, drawing
@@ -258,7 +296,7 @@ half → the remaining slab's face; empty grid → nil.
 |---|---|---|
 | Collision is per block, not per cell | A block below 50 % solid becomes walk-through, above it collides as a full cube | Engine support for per-node collision boxes, or invisible physical entities |
 | Lighting is per node | A carved cavity still occludes sunlight as if solid | Engine micronode lighting (Phase 3 in `docs/subnode-editing-plan.md`) |
-| One entity per merged face | A chaotic carve can reach the budget (`micronode_chisel.max_render_boxes`, default 96) and then renders at a conservative downsample | Engine-side per-block mesh |
+| One entity per merged face | A chaotic carve can reach the budget (`micronode_chisel.max_render_boxes`, default 512) and then renders at a majority-coarsened downsample, which loses features smaller than a coarse cell but never turns the carve back into a full cube | Engine-side per-block mesh; raise the setting or set it to 0 while waiting |
 | 4 materials per block | Pushing a 5th material is refused with a message | Palette per face, or engine support |
 | Editing crosses node borders by creating neighbours | Pushing into a solid non-chiseled node does not convert it (it stops at the boundary) | Convert-on-push, needs a "was converted" marker for undo |
 | `swap_node` keeps metadata | A container node replaced by `/setnode` with leftover metadata is re-initialised empty | — |

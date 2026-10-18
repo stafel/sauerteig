@@ -431,10 +431,17 @@ end
 -------------------------------------------------------------------------------
 -- Render-budget coarsening (emergency path only)
 -------------------------------------------------------------------------------
--- Downsample by an integer factor, treating a coarse cell as solid if *any*
--- source cell is solid. "Any" (not "majority") keeps the shape watertight:
--- the coarsened block never shows a hole where the full-resolution shape is
--- solid. Used only when a block exceeds the entity budget.
+-- Downsample by an integer factor for the render-budget fallback. A coarse
+-- cell is solid only when a strict majority of the source cells it covers are
+-- solid; ties go to air.
+--
+-- Majority, NOT "any": with "any", every carved cavity whose walls are thinner
+-- than one coarse cell gets filled in, so a heavily chiselled block visibly
+-- reverted to a full cube after enough detail accumulated (the "node refills"
+-- bug). Strict majority (ties to air) also stops a checkerboard or a thin
+-- lattice from collapsing into a solid mass. It can drop features smaller than
+-- one coarse cell, but it never invents solid geometry out of a mostly-empty
+-- region.
 function M.coarsen_grid(grid, step, res)
 	res = res or R
 	if step <= 1 then
@@ -445,7 +452,7 @@ function M.coarsen_grid(grid, step, res)
 	for z = 1, ores do
 		for y = 1, ores do
 			for x = 1, ores do
-				local solid = 0
+				local solid, samples = 0, 0
 				for dz = 0, step - 1 do
 					local sz = (z - 1) * step + dz + 1
 					if sz <= res then
@@ -454,15 +461,19 @@ function M.coarsen_grid(grid, step, res)
 							if sy <= res then
 								for dx = 0, step - 1 do
 									local sx = (x - 1) * step + dx + 1
-									if sx <= res and M.get_voxel(grid, sx, sy, sz, res) > 0 then
-										solid = 1
+									if sx <= res then
+										samples = samples + 1
+										if M.get_voxel(grid, sx, sy, sz, res) > 0 then
+											solid = solid + 1
+										end
 									end
 								end
 							end
 						end
 					end
 				end
-				M.set_voxel(out, x, y, z, solid, ores)
+				local value = (samples > 0 and solid * 2 > samples) and 1 or 0
+				M.set_voxel(out, x, y, z, value, ores)
 			end
 		end
 	end

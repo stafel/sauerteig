@@ -556,6 +556,233 @@ local function test_rendering()
 end
 
 -------------------------------------------------------------------------------
+-- Grid steps (the chisel's size selection)
+-------------------------------------------------------------------------------
+
+local function test_grid_steps()
+	check("size_default",
+		M.player_grid_size("mn_size_test") == 1,
+		"a new player starts at 1/16")
+	check("size_set",
+		M.set_player_grid_size("mn_size_test", 4)
+			and M.player_grid_size("mn_size_test") == 4,
+		"set by micronode count")
+	check("size_invalid",
+		not M.set_player_grid_size("mn_size_test", 3)
+			and M.player_grid_size("mn_size_test") == 4,
+		"unsupported steps are rejected")
+
+	M.cycle_player_grid("mn_size_test", 1)
+	M.cycle_player_grid("mn_size_test", 1)
+	check("size_cycle", M.player_grid_size("mn_size_test") == 16,
+		"cycle 4 -> 8 -> 16")
+	M.cycle_player_grid("mn_size_test", 1)
+	check("size_cycle_wrap", M.player_grid_size("mn_size_test") == 1,
+		"after 1/1 the next step is 1/16 again")
+end
+
+-- A real edit_at through a fake player, to prove the selected step changes the
+-- brush (thickness and in-plane extent), not just the chat message.
+local function fake_player(name)
+	return {
+		is_player = function() return true end,
+		get_player_name = function() return name end,
+		get_player_control = function() return {} end,
+		get_pos = function() return {x = TEST_POS.x, y = TEST_POS.y + 3, z = TEST_POS.z} end,
+		get_look_dir = function() return {x = 0, y = -1, z = 0} end,
+		get_properties = function() return {eye_height = 1.625} end,
+	}
+end
+
+local function test_brush_sizes_apply()
+	core.load_area(TEST_POS)
+	M.set_player_grid_size("mn_size_test", 4)
+	local stone = M.fallback_material or M.get_fallback_material()
+	core.set_node(TEST_POS, {name = stone})
+	M.chisel_native(TEST_POS)
+	M.refresh_block(TEST_POS)
+
+	local above = {x = TEST_POS.x, y = TEST_POS.y + 1, z = TEST_POS.z}
+	local function clear_above()
+		M.remove_block_entities(above)
+		M.forget_block(above)
+		core.remove_node(above)
+	end
+	clear_above()
+
+	local ok = M.edit_at(fake_player("mn_size_test"), TEST_POS, "push",
+		M.player_grid_size("mn_size_test"), nil)
+	local filled = M.get_block(above)
+	check("size_push_4", ok and filled ~= nil and M.count_solid(filled.grid) == 64,
+		filled and ("4x4x4 push filled " .. M.count_solid(filled.grid) .. " cells")
+			or "no block created above")
+
+	clear_above()
+	M.set_player_grid_size("mn_size_test", 1)
+	ok = M.edit_at(fake_player("mn_size_test"), TEST_POS, "push",
+		M.player_grid_size("mn_size_test"), nil)
+	filled = M.get_block(above)
+	check("size_push_1", ok and filled ~= nil and M.count_solid(filled.grid) == 1,
+		filled and ("1x1x1 push filled " .. M.count_solid(filled.grid) .. " cells")
+			or "no block created above")
+
+	clear_above()
+	M.remove_block_entities(TEST_POS)
+	M.forget_block(TEST_POS)
+	core.remove_node(TEST_POS)
+	M.forget_player("mn_size_test")
+	M.set_player_grid_size("mn_size_test", 1)
+end
+
+-------------------------------------------------------------------------------
+-- Render budget (the "block turns back into a full cube" regression)
+-------------------------------------------------------------------------------
+
+local function test_render_budget()
+	core.load_area(TEST_POS)
+	check("budget_default_high", M.MAX_RENDER_BOXES >= 256,
+		"default budget is " .. M.MAX_RENDER_BOXES)
+	check("budget_active", M.render_budget() >= 6,
+		"render budget is " .. tostring(M.render_budget()))
+
+	local palette = M.create_palette({"a:stone"})
+	local neighbours = open_neighbors()
+
+	-- A noisy, mostly-empty shape: single cells in a deterministic pattern.
+	-- "any-solid" downsampling would turn this into a solid block.
+	local noisy = M.create_empty_grid()
+	for z = 1, R do
+		for y = 1, R do
+			for x = 1, R do
+				if ((x * 7 + y * 13 + z * 3) % 5) < 2 then
+					M.set_voxel(noisy, x, y, z, 1, R)
+				end
+			end
+		end
+	end
+	local coarse = M.coarsen_grid(noisy, 2, R)
+	check("coarsen_no_refill",
+		M.count_solid(coarse) < #coarse,
+		"a noisy carve must not coarsen into a full block")
+
+	-- A checkerboard is the pathological case for any-solid: strict majority
+	-- with ties going to air keeps it from collapsing into a solid mass.
+	local checker = M.create_empty_grid()
+	for z = 1, R do
+		for y = 1, R do
+			for x = 1, R do
+				if (x + y + z) % 2 == 0 then
+					M.set_voxel(checker, x, y, z, 1, R)
+				end
+			end
+		end
+	end
+	local checker_coarse = M.coarsen_grid(checker, 2, R)
+	check("coarsen_checkerboard", M.is_empty(checker_coarse),
+		"a checkerboard must not collapse into a solid block")
+
+	-- A real cavity must survive downsampling.
+	local carved = M.create_filled_grid(1)
+	for z = 3, R - 2 do
+		for y = 3, R - 2 do
+			for x = 3, R - 2 do
+				local dx, dy, dz = x - 8.5, y - 8.5, z - 8.5
+				if dx * dx + dy * dy + dz * dz < 25 then
+					M.set_voxel(carved, x, y, z, 0, R)
+				end
+			end
+		end
+	end
+	local cavity = M.coarsen_grid(carved, 2, R)
+	check("coarsen_cavity_survives", not M.is_full(cavity),
+		"a carved cavity must stay open when coarsened")
+
+	-- The budget path: a detailed surface needs fewer boxes when coarsened, and
+	-- must never return a full cube for a carved shape. The aligned 4^3 cavity
+	-- survives strict-majority downsampling at every step, so the coarsened
+	-- mesh can never be a plain cube.
+	local stairs = M.create_filled_grid(1)
+	for z = 1, R do
+		for y = 1, R do
+			for x = 1, R do
+				if ((x * 5 + y * 11 + z * 7) % 8) >= 5 then
+					M.set_voxel(stairs, x, y, z, 0, R)
+				end
+			end
+		end
+	end
+	M.fill_box(stairs, 5, 5, 5, 8, 8, 8, 0)
+	local block = {grid = stairs, palette = palette}
+	local full_boxes = M.build_surface_boxes(stairs, palette, open_neighbors(), R)
+	local boxes, step = M.render_boxes(TEST_POS, block, M.MAX_RENDER_BOXES)
+	check("budget_coarsens", #full_boxes > M.MAX_RENDER_BOXES
+			and step > 1 and #boxes <= M.MAX_RENDER_BOXES,
+		#full_boxes .. " full -> step " .. step .. ", " .. #boxes .. " boxes")
+	check("budget_not_full", not M.is_full(M.coarsen_grid(stairs, step, R)),
+		"the fallback kept the carve open")
+
+	-- A coarse mesh keeps the absolute (quarter-micronode) face depth, so its
+	-- inner planes cannot coincide with a full-resolution neighbour's surface.
+	local coarse_full = M.build_surface_boxes(M.create_filled_grid(1, 2), palette,
+		open_neighbors(), 2)
+	local depth_ok = #coarse_full > 0
+	for _, box in ipairs(coarse_full) do
+		local sx = math.abs(box.x1 - box.x0)
+		local sy = math.abs(box.y1 - box.y0)
+		local sz = math.abs(box.z1 - box.z0)
+		if math.min(sx, sy, sz) > 1 / R + 1e-9 then
+			depth_ok = false
+		end
+	end
+	check("budget_depth_bounded", depth_ok,
+		"coarse face slabs stay thinner than one micronode")
+
+	-- A shape that coarsening would erase entirely is rendered at full
+	-- resolution instead of becoming invisible.
+	local thin = M.create_empty_grid()
+	for z = 1, R do
+		for x = 1, R do
+			M.set_voxel(thin, x, 1, z, 1, R)
+		end
+	end
+	boxes, step = M.render_boxes(TEST_POS, {grid = thin, palette = palette}, 2)
+	check("budget_never_invisible", #boxes > 0 and step == 1,
+		#boxes .. " full-resolution boxes instead of an invisible block")
+end
+
+-------------------------------------------------------------------------------
+-- Coarse neighbour masks (stride mapping, used by the render fallback)
+-------------------------------------------------------------------------------
+
+local function test_neighbor_masks()
+	core.load_area(TEST_POS)
+	local stone = M.fallback_material or M.get_fallback_material()
+	local npos = {x = TEST_POS.x + 1, y = TEST_POS.y, z = TEST_POS.z}
+
+	core.set_node(npos, {name = M.BLOCK_NODE})
+	local block = M.create_block_data(stone, M.create_palette({stone}),
+		M.create_empty_grid())
+	M.set_voxel(block.grid, 1, 2, 3, 1, R)
+	M.set_block(npos, block)
+
+	local full = M.build_neighbors(TEST_POS)
+	check("neighbor_mask_full_stride",
+		type(full.px) == "function" and full.px(2, 3) == true
+			and full.px(1, 1) == false,
+		"the full-resolution mask reads the 16^3 stride")
+
+	local coarse = M.build_neighbors(TEST_POS, 2)
+	check("neighbor_mask_coarse_stride",
+		type(coarse.px) == "function" and coarse.px(1, 2) == true
+			and coarse.px(1, 1) == false,
+		"the coarse mask covers a step x step footprint")
+
+	M.remove_block_entities(npos)
+	M.forget_block(npos)
+	core.remove_node(npos)
+end
+
+-------------------------------------------------------------------------------
 -- Performance
 -------------------------------------------------------------------------------
 
@@ -606,6 +833,10 @@ core.after(2.0, function()
 		{"brushes", test_brushes},
 		{"editing", test_editing},
 		{"rendering", test_rendering},
+		{"sizes", test_grid_steps},
+		{"size_brush", test_brush_sizes_apply},
+		{"budget", test_render_budget},
+		{"neighbors", test_neighbor_masks},
 		{"performance", test_performance},
 	}
 	for _, suite in ipairs(suites) do

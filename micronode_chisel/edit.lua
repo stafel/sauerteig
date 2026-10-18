@@ -168,22 +168,44 @@ end
 -- Neighbour culling
 -------------------------------------------------------------------------------
 
-local function boundary_mask(grid, axis, dir)
-	local layer = (dir > 0) and 1 or R
+-- Per-cell culling mask for one face of a neighbouring chiseled block.
+-- `res` is the neighbour's source resolution and `step` the coarsening factor
+-- of the mesh being built (1 = full resolution). A coarse cell is culled when
+-- *any* source cell in its footprint touches the shared boundary; culling
+-- aggressively avoids coincident quads with the neighbour, at the cost of
+-- possibly hiding a thin sliver in the emergency coarse path.
+local function boundary_mask(grid, axis, dir, res, step)
+	res = res or R
+	step = math.max(1, step or 1)
+	local ores = math.ceil(res / step)
+	local layer = (dir > 0) and 1 or res
 	local cache = {}
 	return function(u, v)
-		local key = (u - 1) * R + v
+		local key = (u - 1) * ores + v
 		local hit = cache[key]
 		if hit == nil then
-			local x, y, z
-			if axis == 1 then
-				x, y, z = layer, u, v
-			elseif axis == 2 then
-				x, y, z = u, layer, v
-			else
-				x, y, z = u, v, layer
+			hit = false
+			local u0 = (u - 1) * step + 1
+			local v0 = (v - 1) * step + 1
+			for su = u0, math.min(u0 + step - 1, res) do
+				for sv = v0, math.min(v0 + step - 1, res) do
+					local x, y, z
+					if axis == 1 then
+						x, y, z = layer, su, sv
+					elseif axis == 2 then
+						x, y, z = su, layer, sv
+					else
+						x, y, z = su, sv, layer
+					end
+					if M.get_voxel(grid, x, y, z, res) > 0 then
+						hit = true
+						break
+					end
+				end
+				if hit then
+					break
+				end
 			end
-			hit = M.get_voxel(grid, x, y, z, R) > 0
 			cache[key] = hit
 		end
 		return hit
@@ -191,15 +213,19 @@ local function boundary_mask(grid, axis, dir)
 end
 
 -- Neighbour descriptor for the mesher: true = solid (cull the whole face),
--- function = per-cell culling mask, false/nil = open.
-function M.build_neighbors(pos)
+-- function = per-cell culling mask, false/nil = open. `step` selects the
+-- coarsening factor of the mesh being built, so the per-cell masks are read at
+-- the matching stride instead of the full-resolution one.
+function M.build_neighbors(pos, step)
+	step = step or 1
 	local neighbors = {}
 	for _, side in ipairs(M.SIDES) do
-		local name = core.get_node(M.offset(pos, side.axis, side.dir)).name
+		local npos = M.offset(pos, side.axis, side.dir)
+		local name = core.get_node(npos).name
 		if M.is_container_name(name) then
-			local block = M.get_block(M.offset(pos, side.axis, side.dir))
+			local block = M.get_block(npos)
 			if block then
-				neighbors[side.key] = boundary_mask(block.grid, side.axis, side.dir)
+				neighbors[side.key] = boundary_mask(block.grid, side.axis, side.dir, R, step)
 			else
 				neighbors[side.key] = false
 			end

@@ -28,7 +28,12 @@
 local M = micronode_chisel
 
 M.ENTITY_NAME = "micronode_chisel:box"
-M.MAX_RENDER_BOXES = 96
+-- One entity per merged surface rectangle. A detailed carve can need a few
+-- hundred, so the old default of 96 hit the coarsening fallback on ordinary
+-- builds and made the block look like a full cube again. 512 keeps realistic
+-- shapes at full resolution; override with
+-- `micronode_chisel.max_render_boxes` (0 = no limit) if a client can take more.
+M.MAX_RENDER_BOXES = 512
 
 -- poskey -> {hash = string, objs = {ObjectRef}}
 local rendered = {}
@@ -47,9 +52,18 @@ local function obj_alive(obj)
 	return ok and lua ~= nil
 end
 
+-- Entity budget for a single block. `0` (or negative) disables the limit, i.e.
+-- lets the block render at full resolution no matter how detailed it is.
 function M.render_budget()
-	local configured = core.settings and tonumber(core.settings:get("micronode_chisel.max_render_boxes"))
-	return configured or M.MAX_RENDER_BOXES
+	local configured = core.settings
+		and tonumber(core.settings:get("micronode_chisel.max_render_boxes"))
+	if configured == nil then
+		return M.MAX_RENDER_BOXES
+	end
+	if configured <= 0 then
+		return math.huge
+	end
+	return math.max(6, math.floor(configured))
 end
 
 -- All six faces transparent until on_activate supplies the real textures, so a
@@ -143,8 +157,24 @@ function M.remember(pos, hash, objs)
 	if #objs == 0 then
 		rendered[key] = nil
 	else
-		rendered[key] = {hash = hash, objs = objs}
+		rendered[key] = {hash = hash, objs = objs, pos = pos}
 	end
+end
+
+-- Re-mesh every block this process has rendered. Used after changing the
+-- render budget so the new value takes effect immediately instead of only
+-- after a mapblock reload.
+function M.refresh_all_rendered()
+	local pending = {}
+	for _, entry in pairs(rendered) do
+		if entry.pos then
+			pending[#pending + 1] = entry.pos
+		end
+	end
+	for _, pos in ipairs(pending) do
+		M.update_block_mesh(pos)
+	end
+	return #pending
 end
 
 -- Spawn one entity for a face box. World position and size follow the

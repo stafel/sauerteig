@@ -181,6 +181,7 @@ for _, name in ipairs({
 	"register_tool", "register_lbm", "register_chatcommand",
 	"register_privilege", "register_on_joinplayer", "register_on_leaveplayer",
 	"register_on_mods_loaded", "register_globalstep", "after",
+	"register_on_player_receive_fields", "show_formspec",
 	"chat_send_player", "log", "pos_to_string", "load_area",
 	"get_player_by_name", "is_protected", "get_item_group",
 }) do

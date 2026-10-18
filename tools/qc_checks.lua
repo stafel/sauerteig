@@ -261,10 +261,43 @@ do
 	local carved = M.create_filled_grid(1)
 	M.fill_box(carved, 1, 1, 1, 8, 8, 8, 0)
 	local cgrid, cres = M.coarsen_grid(carved, 2, R)
-	check("coarsen_any_solid_watertight",
-		M.get_voxel(cgrid, 1, 1, 1, cres) == 1 and M.get_voxel(cgrid, 8, 8, 8, cres) == 1,
-		"conservative downsampling never opens a hole")
+	check("coarsen_carve_stays_open",
+		M.get_voxel(cgrid, 1, 1, 1, cres) == 0 and M.get_voxel(cgrid, 8, 8, 8, cres) == 1,
+		"majority downsampling keeps the carved corner empty")
+	check("coarsen_no_inflation",
+		M.count_solid(cgrid) <= M.count_solid(carved),
+		M.count_solid(cgrid) .. " vs " .. M.count_solid(carved))
 	check("coarsen_meshes", #M.build_surface_boxes(cgrid, stone_palette(), open_neighbors(), cres) > 0)
+
+	-- Ties go to air: a checkerboard must not collapse into a solid block.
+	local checker = M.create_empty_grid()
+	for z = 1, R do
+		for y = 1, R do
+			for x = 1, R do
+				if (x + y + z) % 2 == 0 then
+					M.set_voxel(checker, x, y, z, 1, R)
+				end
+			end
+		end
+	end
+	check("coarsen_checkerboard_open", M.is_empty(M.coarsen_grid(checker, 2, R)))
+
+	check("budget_default_high", M.MAX_RENDER_BOXES >= 256, M.MAX_RENDER_BOXES)
+	check("budget_setting_absent", M.render_budget() == M.MAX_RENDER_BOXES)
+
+	-- A coarse mesh keeps the absolute (quarter-micronode) face depth so its
+	-- inner planes cannot coincide with a full-resolution surface.
+	local coarse_boxes = M.build_surface_boxes(M.create_filled_grid(1, 2),
+		stone_palette(), open_neighbors(), 2)
+	local depth_ok = #coarse_boxes > 0
+	for _, box in ipairs(coarse_boxes) do
+		local thin = math.min(math.abs(box.x1 - box.x0), math.abs(box.y1 - box.y0),
+			math.abs(box.z1 - box.z0))
+		if thin > 1 / R + 1e-9 then
+			depth_ok = false
+		end
+	end
+	check("coarsen_depth_bounded", depth_ok)
 end
 
 -------------------------------------------------------------------------------
@@ -423,6 +456,42 @@ do
 		string.format("%.2f solid", M.fill_ratio(grid)))
 	check("collision_ratio", near(M.fill_ratio(M.create_filled_grid(1)), 1))
 	check("collision_empty", M.collision_variant(M.create_empty_grid()) == M.BLOCK_NODE_OPEN)
+end
+
+-------------------------------------------------------------------------------
+print("[qc] chisel sizes")
+-------------------------------------------------------------------------------
+do
+	local name = "qc_sizes"
+	check("size_default", M.player_grid_size(name) == 1)
+	check("size_set", M.set_player_grid_size(name, 8) and M.player_grid_size(name) == 8)
+	check("size_invalid",
+		not M.set_player_grid_size(name, 7) and M.player_grid_size(name) == 8)
+	M.cycle_player_grid(name, 1)
+	check("size_cycle", M.player_grid_size(name) == 16)
+	M.cycle_player_grid(name, 1)
+	check("size_cycle_wrap", M.player_grid_size(name) == 1)
+
+	-- The budget path must coarsen a detailed shape without refilling it.
+	local pos = {x = 40, y = 50, z = 60}
+	local grid = M.create_filled_grid(1)
+	for z = 1, R do
+		for y = 1, R do
+			for x = 1, R do
+				if ((x * 5 + y * 11 + z * 7) % 8) >= 5 then
+					M.set_voxel(grid, x, y, z, 0, R)
+				end
+			end
+		end
+	end
+	M.fill_box(grid, 5, 5, 5, 8, 8, 8, 0)
+	local full_boxes = M.build_surface_boxes(grid, stone_palette(), open_neighbors(), R)
+	local boxes, step = M.render_boxes(pos,
+		{grid = grid, palette = stone_palette()}, M.MAX_RENDER_BOXES)
+	check("budget_coarsens", #full_boxes > M.MAX_RENDER_BOXES
+			and step > 1 and #boxes <= M.MAX_RENDER_BOXES,
+		#full_boxes .. " full -> step " .. step .. ", " .. #boxes .. " boxes")
+	check("budget_not_full", not M.is_full(M.coarsen_grid(grid, step, R)))
 end
 
 -------------------------------------------------------------------------------
