@@ -43,16 +43,15 @@ core.register_entity(ENTITY_NAME, {
 			return
 		end
 		local data = core.parse_json(staticdata)
-		if not data or not data.sx or not data.tex then
+		if not data or not data.sx or not data.texs then
 			self.object:remove()
 			return
 		end
 		self.block_pos = data.block_pos
 		self._staticdata = staticdata
-		local tex = data.tex
 		self.object:set_properties({
 			visual_size = {x = data.sx, y = data.sy, z = data.sz},
-			textures = {tex, tex, tex, tex, tex, tex},
+			textures = data.texs,
 		})
 	end,
 
@@ -80,22 +79,53 @@ end
 
 -- Spawn one static entity per merged box
 -- boxes: list from generate_optimized_nodeboxes (coords in -0.5..0.5)
-local function spawn_box(pos, box, texture)
-	local center = vector.add(pos, vector.new(0.5, 0.5, 0.5))
-	local cx = (box.x0 + box.x1) / 2
-	local cy = (box.y0 + box.y1) / 2
-	local cz = (box.z0 + box.z1) / 2
-	local epos = vector.add(center, vector.new(cx, cy, cz))
+-- Engine facts (visual = "cube"): visual_size is in node units and the cube
+-- is centered on the entity position. Each face maps its whole texture, so
+-- textures must be cropped to the box's proportional region of the base
+-- texture (like nodebox UV mapping does) to avoid stretching/warping.
+local function crop_16(tex, u0, v0, u1, v1)
+	-- Normalize to 16px so the crop is texture-pack agnostic
+	local base = tex .. "^[resize:16x16"
+	local x = math.floor(math.max(0, math.min(1, u0)) * 16 + 0.5)
+	local y = math.floor(math.max(0, math.min(1, v0)) * 16 + 0.5)
+	local w = math.max(1, math.floor(math.max(0, math.min(1, u1)) * 16 + 0.5) - x)
+	local h = math.max(1, math.floor(math.max(0, math.min(1, v1)) * 16 + 0.5) - y)
+	local escaped = base:gsub("([%^:])", "\\%1")
+	return string.format("[combine:%dx%d:%d,%d=%s", w, h, x, y, escaped)
+end
 
+local function face_textures(tex, box)
+	local tx0, tx1 = box.x0 + 0.5, box.x1 + 0.5
+	local ty0, ty1 = box.y0 + 0.5, box.y1 + 0.5
+	local tz0, tz1 = box.z0 + 0.5, box.z1 + 0.5
+	-- Nodebox-style UV regions, texture order: +Y, -Y, +X, -X, +Z, -Z
+	return {
+		crop_16(tex, tx0, 1 - tz1, tx1, 1 - tz0),
+		crop_16(tex, tx0, tz0, tx1, tz1),
+		crop_16(tex, tz0, 1 - ty1, tz1, 1 - ty0),
+		crop_16(tex, 1 - tz1, 1 - ty1, 1 - tz0, 1 - ty0),
+		crop_16(tex, 1 - tx1, 1 - ty1, 1 - tx0, 1 - ty0),
+		crop_16(tex, tx0, 1 - ty1, tx1, 1 - ty0),
+	}
+end
+
+local function spawn_box(pos, box, texture)
+	local sx = math.max(box.x1 - box.x0, 0.001)
+	local sy = math.max(box.y1 - box.y0, 0.001)
+	local sz = math.max(box.z1 - box.z0, 0.001)
+	-- Entity sits at the box center; the cube visual extends +/- size/2
+	local center = vector.add(pos, vector.new(
+		(box.x0 + box.x1) / 2 + 0.5,
+		(box.y0 + box.y1) / 2 + 0.5,
+		(box.z0 + box.z1) / 2 + 0.5))
 	local data = core.write_json({
 		block_pos = {x = pos.x, y = pos.y, z = pos.z},
-		sx = math.max(box.x1 - box.x0, 0.001),
-		sy = math.max(box.y1 - box.y0, 0.001),
-		sz = math.max(box.z1 - box.z0, 0.001),
-		tex = texture,
+		sx = sx,
+		sy = sy,
+		sz = sz,
+		texs = face_textures(texture, box),
 	})
-
-	core.add_entity(epos, ENTITY_NAME, data)
+	core.add_entity(center, ENTITY_NAME, data)
 end
 
 ------------------------------------------------------------------------------
