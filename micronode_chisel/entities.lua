@@ -91,7 +91,10 @@ local function crop_16(tex, u0, v0, u1, v1)
 	local w = math.max(1, math.floor(math.max(0, math.min(1, u1)) * 16 + 0.5) - x)
 	local h = math.max(1, math.floor(math.max(0, math.min(1, v1)) * 16 + 0.5) - y)
 	local escaped = base:gsub("([%^:])", "\\%1")
-	return string.format("[combine:%dx%d:%d,%d=%s", w, h, x, y, escaped)
+		-- [combine:WxH:x,y=tex blits tex at (x,y) ONTO the WxH canvas:
+	-- cropping therefore uses negative offsets so the wanted region
+	-- lands inside the canvas (see texture-modifier docs).
+	return string.format("[combine:%dx%d:%d,%d=%s", w, h, -x, -y, escaped)
 end
 
 local function face_textures(tex, box)
@@ -193,3 +196,17 @@ function M.update_block_mesh(pos)
 end
 
 print("[micronode_chisel] Entity rendering loaded")
+
+------------------------------------------------------------------------------
+-- Rebuild meshes on load
+------------------------------------------------------------------------------
+
+core.register_lbm({
+	name = "micronode_chisel:rebuild_meshes",
+	label = "Rebuild micronode render entities",
+	nodenames = {"micronode_chisel:chiseled_block"},
+	run_at_every_load = true,
+	action = function(pos)
+		M.update_block_mesh(pos)
+	end,
+})
