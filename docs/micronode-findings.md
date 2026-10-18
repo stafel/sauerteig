@@ -137,9 +137,20 @@ Per-face textures are produced in `entities.lua`:
 | Textures stretched/warped | Cube visual maps whole texture per face; no crop (§3) |
 | Open sides (invisible faces) | `[combine` blit offsets positive instead of negative |
 | Node "refills" at ~12% chiseled | Render-budget fallback spawned one full-block box |
+| Block rendered as "split up parts" with seams | Face quads were paper-thin; faces only met edge-to-edge (no volume overlap) |
 | Rest of node invisible + floating top | Mesher read coarse grid with 16³ stride (§2 gotcha) |
 | Startup crash ×3 (`solid_outside_sides`, `block_grid`, `voxel` nil) | Multi-step patch scripts: a later step's `assert` failure rolled back part of an edit while another step's changes had already landed |
 | Spawned stone block kills player | `test_entity_rendering` placed a node at (0,40,0) — the spawn column — on every world start |
+
+### Face depth (split-part bug)
+
+Paper-thin (1/64) face quads only touch at their edges → the block
+read as "split up parts" with visible seams at every corner. Each face
+box now extends **one full voxel (1/R) INTO the solid**, so adjoining
+faces/quads overlap inside the shape and it reads as one continuous
+solid; the outward surface planes stay exact. Consequence: face boxes
+can have **reversed extents** (e.g. x: 0.5 → 0.4375); `spawn_box`
+normalizes min/max before computing size and origin.
 
 **Process lesson**: every shipped crash class (orphaned reference) came
 from scripted multi-block edits. Rules:
