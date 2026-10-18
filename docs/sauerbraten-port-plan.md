@@ -316,6 +316,65 @@ M3 (template + in-engine acceptance).
 
 ---
 
+## 7a. M0 progress and measured findings
+
+Answers to §8 taken as decisions: **1:1 scale**, **~10³ region proof of concept
+first**, **patched server acceptable as a test-only oracle**.
+
+### Implemented
+
+| Artifact | What it is |
+|---|---|
+| `tools/ogz/ogz.lua` | The reader: gzip framing, header, vars, game ident, texture MRU, entities, vslots, octree, lightmap/PVS/blendmap skip, leaf corner decode, region filter. Plain Lua 5.1 (no `bit`, no `//`, no `goto`) so it runs in-engine, under lupa, and in a stock interpreter |
+| `tools/ogz/selftest.lua` | Synthetic fixture (hand-built bytes covering every construct) + optional real-map layer |
+| `tools/ogz/world.mt` + `worldmods/ogz_selftest/` | Runs the synthetic layer inside the engine |
+
+Two things that make this runnable at all, both now recorded because they cost
+real time to rediscover:
+
+* **The Lua sandbox forbids reading outside the world/mod/game/mod_data paths**
+  (`src/script/cpp_api/s_security.cpp:869-931`) and `secure.*` settings cannot be
+  set from Lua (`l_util`/`l_settings.cpp:39`). The way in is to make the *world
+  directory* the directory that contains the files you want to read. That needs
+  no `secure.trusted_mods` and no `--insecure-no-sandbox`.
+* `core.decompress` has no gzip method, so `M.gunzip` parses the RFC 1952
+  framing and delegates only raw inflate (`opts.inflate_raw`). In-engine that is
+  `core.decompress(bytes, "raw_deflate")`.
+
+### Verified
+
+* Synthetic layer: 16 checks, all passing. It found **three real bugs**:
+  the missing second `u16` (`eif`) after the game ident, `read_children` using
+  half the child size, and inclusive-vs-half-open region bounds.
+* Real maps: `arbana`, `academy`, `complex`, `abbey` parse to **exactly** the
+  decompressed size (`stream_complete`), i.e. the header/vars/entity/vslot/
+  octree/lightmap/PVS/blendmap layout is right for version-33 files.
+
+### Open defects in the reader (blocking M1)
+
+Measured on `sauerbraten/packages/base`:
+
+1. **Leaf bounds are impossible** on maps that otherwise complete the stream:
+   `arbana` (world 8192) yields leaves up to x = 49152; `abbey` (2048) up to
+   10240; `academy`/`complex` (1024) up to 3584. A silent misparse that still
+   consumes the same byte count, so `stream_complete` alone cannot catch it —
+   the bounds assertion does. Most likely candidate: the surface block's
+   per-vertex loop leaving the octree aligned only by coincidence, or a
+   depth-dependent offset error. **This is the next thing to fix**, and the
+   patched-server oracle (Option C) is the fastest way to localise it.
+2. **Pre-32 map versions are not implemented.** The corpus is not all v33:
+   `box_demo` is v24, `aard3c` v29, `aqueducts`/`canyon`/`curvy_castle`/
+   `c_egypt` v31. Versions ≤31 use an entirely different octree branch
+   (`surfacecompat`, `convertoldsurfaces`) and ≤32 a 1-byte material. Decision
+   needed: implement the legacy layouts, or restrict the tool to v32/33 and
+   convert only maps we author ourselves (which is the stated end goal anyway).
+
+The bounds assertion and the explicit version check above are deliberately kept
+in the test rather than loosened: they are what turned "it parses" into "it
+parses correctly".
+
+---
+
 ## 8. Risks and open questions
 
 | Risk / question | Impact | Mitigation / decision needed |
@@ -333,11 +392,14 @@ M3 (template + in-engine acceptance).
 **Decisions I need from you before M1:**
 1. Is 1:1 (1 cube = 1 node, oversized architecture) the starting point, or do
    you want the 1:2 compromise from the start?
+   1:1 with oversized architecture is good.
 2. Do we convert *whole maps* for exploration (slow, big) or go region-first
    (recommended) and only add whole-map export later?
+   A proof of concept region (like 10m³) first before doing whole maps.
 3. Is a patched Sauerbraten server build acceptable as a *test-only* oracle
    (not shipped, not a CI dependency), or should correctness rest on my own
    fixture maps only?
+   A patched server is fine as test-only.
 
 ---
 

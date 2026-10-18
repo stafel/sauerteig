@@ -5,6 +5,30 @@
 # Lua test servers built from the luanti source
 /luanti-build/
 
+# Artifacts of the tools/ogz in-engine harness: world.mt at the repository root
+# makes the repo itself a throwaway Luanti world so the mod sandbox allows
+# reading both tools/ogz/*.lua and sauerbraten/packages/base/*.ogz.
+# Safe to delete; see docs/sauerbraten-port-plan.md, section 7a.
+/worldmods/
+/map.sqlite
+/map_meta.txt
+/mod_storage.sqlite
+/players.sqlite
+/env_meta.txt
+/force_loaded.txt
+/ipban.txt
+/worldmods_here.txt
+
+# Same, for the synthetic-only harness world inside tools/ogz
+/tools/ogz/map.sqlite
+/tools/ogz/map_meta.txt
+/tools/ogz/mod_storage.sqlite
+/tools/ogz/players.sqlite
+/tools/ogz/env_meta.txt
+/tools/ogz/force_loaded.txt
+/tools/ogz/ipban.txt
+/tools/ogz/worldmods_here.txt
+
 # OS/editor noise
 *.swp
 *~
