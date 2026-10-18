@@ -4,7 +4,27 @@
 -- The world directory is the repository root (see world.mt) so the mod sandbox
 -- allows reading the module, the corpus manifest and the maps. No
 -- `secure.trusted_mods` and no insecure environment are involved.
+--
+-- Driven by tools/ogz/run.txt: the corpus test runs only when that file has a
+-- `corpus` directive, so the porter and the corpus run can be triggered
+-- independently.
 local world = core.get_worldpath()
+
+local function has_corpus_directive()
+	local handle = io.open(world .. "/tools/ogz/run.txt", "rb")
+	if not handle then return false end
+	local found = false
+	for line in handle:lines() do
+		line = line:gsub("#.*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+		if line == "corpus" then found = true end
+	end
+	handle:close()
+	return found
+end
+
+if not has_corpus_directive() then
+	return
+end
 
 local function load_module(relpath)
 	local handle = assert(io.open(world .. "/" .. relpath, "rb"),

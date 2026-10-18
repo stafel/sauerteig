@@ -316,7 +316,7 @@ M3 (template + in-engine acceptance).
 
 ---
 
-## 7a. M0 progress and measured findings
+## 7a. M0/M1 progress and measured findings
 
 Answers to §8 taken as decisions: **1:1 scale**, **~10³ region proof of concept
 first**, **patched server acceptable as a test-only oracle**.
@@ -366,6 +366,48 @@ Two engine facts that make this runnable, both expensive to rediscover:
 | Leaves far outside the world (`x` up to 6× worldsize) while the byte count still matched | `CHILDREN` nodes were read with the parent's size; the engine gives children **half** the size. `stream_complete` alone could never catch this - the in-bounds assertion did |
 | `aard3c`, `aqueducts` desync | `normalscompat` is `bvec[4]` and `bvec` is **3 bytes** (`geom.h:1273`), so 12 bytes, not the 4 I assumed |
 | Region filter kept everything | Bounds documented inclusive but compared half-open |
+
+### M1: the region porter (done, proof of concept)
+
+`tools/ogz/port.lua` voxelizes a region; `worldmods/ogzport` (repo root) exports
+it and the `worldmods/ogzport` inside a target world imports it. A demo world
+`sauerbraten_port` (abbey, 128³) is the current deliverable.
+
+**Why there are two stages.** The mod sandbox only allows reads under the world,
+mod, game and `mod_data` paths. The `.ogz` lives in the engine clone and the
+target world lives in the user's worlds directory, so no single process can do
+both. The export step therefore writes a compact payload (dense byte grid +
+palette + metadata) into `mod_data`, the one place every world may read from, and
+the import step picks it up. `payload_id` carries a converter revision, so a
+changed conversion causes a re-import instead of leaving stale geometry.
+
+**Region selection** ranks candidate windows by material *diversity* after a
+density pre-filter. Density alone picks monoliths: the first attempt landed on a
+region where 177 of 180 leaf faces used one texture, which looks the same
+whether or not the geometry is right.
+
+**Verified.** The importer reads the map back and compares both the non-air count
+and a checksum of content ids against what it wrote; abbey's 128³ region matches
+exactly (134,998 nodes, checksum equal). Voxelizing 2.1 M cells takes ~0.3 s in
+the box fast path and ~18 s for a region with 4,421 dragged-corner leaves; the
+map write is ~0.1 s.
+
+**Bugs these checks caught** (each would have shipped silently):
+
+| Symptom | Cause |
+|---|---|
+| Payload 1 byte/cell looked plausible, but every cell was non-zero | `table.concat` on a table of *numbers* writes their decimal text, not bytes. Needs `string.char`. Caught by the read-back count |
+| Every face resolved to the same material | Sauerbraten texture slots are **0-based**, the palette array is 1-based. Caught by the material histogram, which reported "1 distinct" |
+| A whole region of walls as flowing water | A texture *named* water was classified as a liquid. Liquids must come only from the cube's material bitfield; solid geometry is often textured with `water2.jpg` |
+| Region selection pointed at empty map areas | Candidate windows were stored as coarse-cell indices and then used as world coordinates |
+
+**Still approximated:** materials (keyword classifier plus a stable hash fallback,
+so different textures stay visually distinct but colours are not the original
+ones), no entities, no liquids in the shipped demo region, and axis handedness is
+argued from the source but has not been checked against a rendering — that is
+what the oracle is for.
+
+---
 
 ### Oracle (Option C): written, not yet executed
 

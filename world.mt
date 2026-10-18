@@ -1,5 +1,6 @@
-# Throwaway world used only to verify tools/ogz/ogz.lua against real
-# Sauerbraten maps inside the engine (docs/sauerbraten-port-plan.md, 7a).
+# Throwaway world used only to run the tools/ogz harness inside the engine
+# (reader corpus verification and region export). See
+# docs/sauerbraten-port-plan.md, 7a and tools/ogz/README.md.
 #
 # The world directory is deliberately the repository root: the mod sandbox only
 # permits reads under the world, mod, game and mod_data paths
@@ -7,8 +8,11 @@
 # both tools/ogz/*.lua and sauerbraten/packages/base/*.ogz. No trusted mod and
 # no insecure environment are involved.
 #
-# Delete this file, worldmods/ogz_dev/ and the artifacts listed in .gitignore
-# when the harness is no longer needed.
+# What the harness does is chosen by tools/ogz/run.txt, not by settings here:
+# world.mt keys are not exposed through `core.settings`.
+#
+# Delete this file, worldmods/ogz_dev, worldmods/ogzport and the artifacts
+# listed in .gitignore when the harness is no longer needed.
 gameid = minetest
 backend = sqlite3
 player_backend = sqlite3

@@ -1,0 +1,14 @@
+# Directives for the in-engine tools/ogz harness.
+#
+# One directive per line; a leading '#' is a comment. Both harness mods read this
+# file and act only on the directive that concerns them:
+#
+#   corpus                     -- worldmods/ogz_dev: verify the map corpus
+#   export <map> <size>        -- worldmods/ogzport: voxelize a region and write
+#                                 a payload into mod_data for the importer
+#   scan <size> <map> <map>... -- worldmods/ogzport: report what each map would
+#                                 give (region, distinct textures, materials)
+#
+# Delete the file (or leave it without directives) to make both mods inert.
+# See docs/sauerbraten-port-plan.md, section 7a.
+export abbey 128
