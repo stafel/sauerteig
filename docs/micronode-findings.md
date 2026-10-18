@@ -61,8 +61,9 @@ Sauerbraten's editing feel comes from three properties, replicated here:
 
 1. **Surface-only rendering.** Only faces where solid borders air exist, and
    coplanar same-material faces are greedily merged into maximal rectangles per
-   slice (`mesh.lua: M.build_surface_boxes`). No interior geometry, no
-   overlapping solid boxes, no z-fighting inside the shape.
+   slice (`mesh.lua: M.build_surface_boxes`). Exactly one *drawn* quad per
+   exposed face — no interior geometry, no overlapping solid boxes, no
+   coincident coplanar quads (§3).
 2. **Exact picking.** A voxel DDA march (Amanatides & Woo) along the look ray
    finds the first solid micronode and its entry-face normal
    (`edit.lua: M.raycast_grid`). Pull carves inward from that face, push adds a
@@ -121,6 +122,31 @@ Seams between perpendicular faces are *not* what the extrusion fixes — exact
 math already makes the faces share edges. The historical "split up parts" look
 was the transform bug of §1.
 
+### One drawn quad per face box (the z-fighting rule)
+
+A face box is a cube entity, so it carries six quads, but only its **outward**
+quad belongs to the visible surface. The other five must be invisible: the box
+of a `+X` face spans `x ∈ [plane-d, plane]` and, at the top of its rectangle,
+`y = 0.5` — which is exactly the plane of the `+Y` face box beside it. Two
+opaque coplanar quads at the same depth fight for the depth buffer, which is the
+flicker seen along every chiselled edge.
+
+`render.lua: M.face_textures` therefore puts the material crop on the outward
+face only and `M.HIDDEN_TEXTURE` (`blank.png`) on the rest. That is reliable
+because entity cube visuals use `TILE_MATERIAL_BASIC` →
+`EMT_TRANSPARENT_ALPHA_CHANNEL_REF` → `USE_DISCARD_REF`, so fragments with
+alpha < 0.5 are discarded rather than drawn
+(`src/client/shader.cpp:888,807`, `object_shader/opengl_fragment.glsl:383`).
+The quads are never rasterised: no blending, no sort order, no depth writes.
+Do not "overlap them instead" — offsetting cannot remove a coincident plane,
+only hide it under another one.
+
+Invariant to preserve: **each exposed micronode face produces exactly one drawn
+quad, and no two drawn quads share a plane with overlapping area.** Both the
+in-engine suite (`test_drawable_quads`) and the QC harness
+(`[qc] z-fighting invariant`) assert it on a full block, a corner carve, a
+cavity and a one-voxel shelf.
+
 ### Neighbour culling
 
 Faces on a node boundary are dropped when the adjacent node is a full solid
@@ -154,9 +180,8 @@ faces and across blocks (Sauerbraten-style world-aligned texturing):
 - UV regions follow `createCubeMesh`'s per-face UV winding; texture/tile order
   is **+Y, -Y, +X, -X, +Z, -Z**.
 
-Only the outward face of a slab is ever visible, so the same crop is reused for
-all six cube faces (cheaper texture strings, no media cost — modifiers are
-resolved client-side).
+The crop is applied to the outward face only (see above); the remaining five
+faces carry `blank.png`.
 
 ---
 
@@ -194,6 +219,7 @@ half → the remaining slab's face; empty grid → nil.
 | Spawned stone block kills player | `test_entity_rendering` placed a node in the spawn column on every world start |
 | Edits that silently did nothing | Brush material index written into the grid without registering it in the block palette; palette entries were never compacted, so the 4 slots filled with dead materials |
 | Crash `mesh.lua: attempt to compare number with nil` on any non-full block | The per-slice face mask is **sparse** (only exposed cells are stored), so `mask[...]` is `nil` for unexposed cells. `mat > 0` then compares nil. A fully solid block has a dense mask, which is why only slabs/carves crashed. Read masks as `mask[...] or 0` |
+| Shimmer / flicker along chiselled edges | Every face box drew all six of its quads, so a slab's side quad sat exactly in the neighbouring face box's outward plane — two opaque coplanar quads z-fighting. Fixed by drawing only the outward quad (§3) |
 | A crash in one self-test hid all later ones | The suites ran unwrapped in a single `core.after` callback, so the first error aborted the run. Each suite is now `pcall`ed and reported individually |
 | Process lesson | Never script a multi-part edit where one part can fail after another part was written. Run `python3 tools/headless_qc.py` before pushing — its strict-globals pass catches orphaned references, its render audit catches transform and crop regressions |
 
@@ -203,8 +229,10 @@ half → the remaining slab's face; empty grid → nil.
 
 - `micronode_chisel/test.lua` — in-engine self tests, run ~2 s after server
   start (`micronode_chisel.tests = false` disables). Covers data, storage,
-  palette, transforms, meshing, picking, brushes, editing/undo integration, the
-  entity transform (entity positions must equal box centers) and benchmarks.
+  palette, transforms, meshing, the drawable-quad (z-fighting) invariant,
+  picking, brushes, editing/undo integration, the entity transform (entity
+  positions must equal box centers) and benchmarks. Each suite is `pcall`ed and
+  reported separately, so one raised error cannot hide the rest.
 - `tools/stub.lua` — headless engine stub: node store, metadata store, entity
   store with ObjectRef-ish objects, JSON passthrough.
 - `tools/qc_checks.lua` + `tools/headless_qc.py` — runs the real mod Lua against
@@ -212,11 +240,14 @@ half → the remaining slab's face; empty grid → nil.
   - storage round trips and the 1 byte/cell size bound,
   - mesher invariants (count, bounds, outward planes, one thin axis, per-cell
     neighbour culling, material splits, hash sensitivity),
+  - the **z-fighting invariant**: no two drawn quads may be coplanar with
+    overlapping area, checked on a full block, a staircase, a cavity, a corner
+    carve and a one-voxel shelf,
   - render-budget coarsening,
   - DDA picking and brush regions,
   - the **render audit**: chisel → carve → re-mesh, then verify every entity
-    sits at its box center with the exact box size, inside the node, with
-    parseable `[combine` crops,
+    sits at its box center with the exact box size, inside the node, drawing
+    exactly one face with a parseable `[combine` crop,
   - a strict `_G` pass that raises on undefined global reads.
 
 ---

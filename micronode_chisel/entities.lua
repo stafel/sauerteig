@@ -52,6 +52,8 @@ function M.render_budget()
 	return configured or M.MAX_RENDER_BOXES
 end
 
+-- All six faces transparent until on_activate supplies the real textures, so a
+-- half-initialised entity is never visible as a cube.
 local PLACEHOLDER = {"blank.png", "blank.png", "blank.png",
 	"blank.png", "blank.png", "blank.png"}
 

@@ -6,17 +6,18 @@
 -- geometry, so nothing z-fights *inside* the shape, and the silhouette is
 -- exactly the voxel silhouette.
 --
--- Each emitted box is the face rectangle extruded slightly INTO the solid.
--- The extrusion exists so no box is degenerate and neighbouring faces
--- interpenetrate at their shared edges instead of only touching; the outward
--- plane of every box stays exactly on the voxel boundary, which is what makes
--- neighbouring boxes line up without seams.
+-- Each emitted box is the face rectangle extruded slightly INTO the solid, so
+-- the box is non-degenerate and its outward plane sits exactly on the voxel
+-- boundary. The exact outward plane is what makes neighbouring boxes line up.
 --
--- Depth must stay well below one micronode: with a full-voxel depth, a
--- one-voxel-thick feature (a shelf, a wall) gets two face boxes whose inner
--- planes coincide exactly, which z-fights wherever the viewer can see the
--- inner planes. Surface planes are always at least 1/RESOLUTION apart, so a
+-- Depth stays well below one micronode: at a full-voxel depth, a one-voxel
+-- thick feature (a shelf, a wall) produces two boxes whose *inner* planes
+-- coincide exactly. Surface planes are always >= 1/RESOLUTION apart, so a
 -- quarter-voxel depth can never coincide with another surface.
+--
+-- Coplanar overlap between *side* quads is handled on the render side: only the
+-- outward face of each box is drawn, the other five are discarded
+-- (see render.lua, "ONE OPAQUE FACE PER ENTITY").
 --
 -- Neighbour culling: faces on a node boundary are dropped when the adjacent
 -- node is solid, or -- per voxel -- when the adjacent chiseled block has a

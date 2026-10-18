@@ -10,9 +10,32 @@
 -- [combine blits at (x, y) ONTO the output canvas, so a crop needs negative
 -- offsets; positive offsets land outside the canvas and yield a fully
 -- transparent face (an invisible block).
+--
+-- ONE OPAQUE FACE PER ENTITY: a face box is a cube, so it has six quads, but
+-- only the outward one belongs to the visible surface. The other five are
+-- textured with HIDDEN_TEXTURE and are discarded at render time. This is the
+-- same invariant Sauerbraten gets from emitting surface quads only, and it is
+-- what keeps chiselled edges from flickering:
+--
+--   the box of a +X face spans x in [plane-d, plane] and, say, y up to the top
+--   of its rectangle; its +Y side quad therefore lies exactly in y = 0.5, the
+--   very plane of the +Y face box next to it. Two opaque coplanar quads at the
+--   same depth fight for the depth buffer -> the shimmer along every edge.
+--   Making the non-outward quads invisible removes the duplicate instead of
+--   trying to out-offset it.
+--
+-- Invisibility is reliable here because entity cube visuals use
+-- TILE_MATERIAL_BASIC -> EMT_TRANSPARENT_ALPHA_CHANNEL_REF -> the object shader
+-- discards fragments with alpha < 0.5 (shader.cpp:888/807,
+-- object_shader/opengl_fragment.glsl:383). blank.png is fully transparent, so
+-- those quads are never rasterised - no blending, no sort order, no depth
+-- writes.
 
 local M = micronode_chisel
 local R = M.RESOLUTION
+
+-- Texture used for the cube faces that must not be drawn.
+M.HIDDEN_TEXTURE = "blank.png"
 
 -------------------------------------------------------------------------------
 -- Texture cropping
@@ -56,13 +79,20 @@ function M.face_uv(box)
 	return x0 + 0.5, 0.5 - y1, x1 + 0.5, 0.5 - y0 -- -Z
 end
 
--- Six-texture array for a face box (only the outward face is ever visible; the
--- same crop is repeated so the buried faces are textured consistently).
+-- Six-texture array for a face box: the crop on the outward face, nothing on
+-- the other five (see the header for why the hidden ones must be discarded
+-- rather than drawn).
 function M.face_textures(box)
 	local tile = M.get_tile(box.material, M.cube_face(box.axis, box.dir))
 	local u0, v0, u1, v1 = M.face_uv(box)
 	local texture = M.crop_texture(tile, u0, v0, u1, v1)
-	return {texture, texture, texture, texture, texture, texture}
+
+	local visible = M.cube_face(box.axis, box.dir)
+	local textures = {}
+	for i = 1, 6 do
+		textures[i] = (i == visible) and texture or M.HIDDEN_TEXTURE
+	end
+	return textures
 end
 
 -------------------------------------------------------------------------------

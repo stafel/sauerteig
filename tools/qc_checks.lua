@@ -328,9 +328,93 @@ do
 end
 
 -------------------------------------------------------------------------------
+print("[qc] z-fighting invariant (no two drawn quads are coplanar)")
+-------------------------------------------------------------------------------
+-- Every drawn quad is the outward face of one face box. Two drawn quads in the
+-- same plane that also overlap would fight for the depth buffer. This walks a
+-- carved shape and asserts that never happens for the boxes the mesher emits.
+do
+	local function drawn_quad(box)
+		local x0, x1 = math.min(box.x0, box.x1), math.max(box.x0, box.x1)
+		local y0, y1 = math.min(box.y0, box.y1), math.max(box.y0, box.y1)
+		local z0, z1 = math.min(box.z0, box.z1), math.max(box.z0, box.z1)
+		-- Only the outward face of a box is drawn; its plane is the outward one
+		local plane
+		if box.axis == 1 then
+			plane = (box.dir > 0) and x1 or x0
+		elseif box.axis == 2 then
+			plane = (box.dir > 0) and y1 or y0
+		else
+			plane = (box.dir > 0) and z1 or z0
+		end
+		local quad = {axis = box.axis, plane = plane}
+		if box.axis == 1 then
+			quad.u0, quad.u1, quad.v0, quad.v1 = y0, y1, z0, z1
+		elseif box.axis == 2 then
+			quad.u0, quad.u1, quad.v0, quad.v1 = x0, x1, z0, z1
+		else
+			quad.u0, quad.u1, quad.v0, quad.v1 = x0, x1, y0, y1
+		end
+		return quad
+	end
+
+	local function overlaps(a, b)
+		if a.axis ~= b.axis then
+			return false
+		end
+		if not near(a.plane, b.plane, 1e-9) then
+			return false
+		end
+		local u = math.min(a.u1, b.u1) - math.max(a.u0, b.u0)
+		local v = math.min(a.v1, b.v1) - math.max(a.v0, b.v0)
+		-- touching edges (u == 0) are fine; a positive area is a real overlap
+		return u > 1e-9 and v > 1e-9
+	end
+
+	local function audit(label, grid)
+		local boxes = M.build_surface_boxes(grid, stone_palette(), open_neighbors(), R)
+		local quads = {}
+		for _, box in ipairs(boxes) do
+			quads[#quads + 1] = drawn_quad(box)
+		end
+		local clashes = 0
+		for i = 1, #quads do
+			for j = i + 1, #quads do
+				if overlaps(quads[i], quads[j]) then
+					clashes = clashes + 1
+				end
+			end
+		end
+		check("zfighting_" .. label, clashes == 0,
+			clashes .. " coplanar overlapping drawn quads out of " .. #quads)
+	end
+
+	audit("full", M.create_filled_grid(1))
+
+	local combs = M.create_filled_grid(1)
+	for i = 1, 6 do
+		M.fill_box(combs, 1, 1, 1, 2 * i, R, R, 0)
+	end
+	audit("stairs", combs)
+
+	local cavity = M.create_filled_grid(1)
+	M.set_voxel(cavity, 8, 8, 8, 0)
+	M.set_voxel(cavity, 9, 8, 8, 0)
+	audit("cavity", cavity)
+
+	-- The reported symptom: a chiselled edge, i.e. a box corner on the surface.
+	local corner = M.create_filled_grid(1)
+	M.fill_box(corner, 1, 1, 1, 8, 8, 8, 0)
+	audit("corner_carve", corner)
+
+	local shelf = M.create_empty_grid()
+	M.fill_box(shelf, 1, 8, 1, R, 8, R, 1)
+	audit("one_voxel_shelf", shelf)
+end
+
+-------------------------------------------------------------------------------
 print("[qc] collision variant")
 -------------------------------------------------------------------------------
-
 do
 	local grid = M.create_filled_grid(1)
 	check("collision_full_solid", M.collision_variant(grid) == M.BLOCK_NODE)
@@ -380,10 +464,11 @@ do
 				sx = math.abs(box.x1 - box.x0),
 				sy = math.abs(box.y1 - box.y0),
 				sz = math.abs(box.z1 - box.z0),
+				face = M.cube_face(box.axis, box.dir),
 			}
 		end
 
-		local placed, sized, inside = 0, 0, true
+		local placed, sized, inside, single_face = 0, 0, true, 0
 		for _, obj in ipairs(objs) do
 			local key = string.format("%.6f:%.6f:%.6f", obj.pos.x, obj.pos.y, obj.pos.z)
 			local want = wanted[key]
@@ -400,31 +485,46 @@ do
 					or math.abs(obj.pos.z - pos.z) + d.sz / 2 > 0.5 + 1e-6 then
 					inside = false
 				end
-				-- texture crops must be non-empty and land inside the canvas
+
+				-- Exactly ONE drawn face (the outward one) and the crop must be
+				-- a valid [combine landing inside its canvas. Coplanar duplicate
+				-- quads are the z-fighting bug this invariant prevents.
+				local visible = want.face
+				local drawn, bad = 0, false
 				for i = 1, 6 do
 					local tex = d.texs[i]
-					if type(tex) ~= "string" or not tex:find("^%[combine:") then
-						inside = false
-					else
-						local dims, rest = tex:match("^%[combine:(%d+x%d+):(.+)$")
-						local w, h = 0, 0
-						if dims then
-							w, h = dims:match("(%d+)x(%d+)")
-							w, h = tonumber(w), tonumber(h)
+					if i == visible then
+						drawn = drawn + 1
+						if type(tex) ~= "string" or not tex:find("^%[combine:") then
+							bad = true
+						else
+							local dims, rest = tex:match("^%[combine:(%d+x%d+):(.+)$")
+							local w, h = 0, 0
+							if dims then
+								w, h = dims:match("(%d+)x(%d+)")
+								w, h = tonumber(w), tonumber(h)
+							end
+							local bx, by = rest and rest:match("^(%-?%d+),(%-?%d+)=")
+							bx, by = tonumber(bx), tonumber(by)
+							if not w or w < 1 or not h or h < 1 or not bx or not by
+								or bx >= w or by >= h or bx <= -R * 4 or by <= -R * 4 then
+								bad = true
+							end
 						end
-						local bx, by = rest and rest:match("^(%-?%d+),(%-?%d+)=")
-						bx, by = tonumber(bx), tonumber(by)
-						if not w or w < 1 or not h or h < 1 or not bx or not by
-							or bx >= w or by >= h or bx <= -R * 4 or by <= -R * 4 then
-							inside = false
-						end
+					elseif tex ~= M.HIDDEN_TEXTURE then
+						bad = true
 					end
+				end
+				if drawn == 1 and not bad then
+					single_face = single_face + 1
 				end
 			end
 		end
 		check(label .. "_positions", placed == #boxes, placed .. "/" .. #boxes)
 		check(label .. "_sizes", sized == #boxes, sized .. "/" .. #boxes)
-		check(label .. "_inside_node", inside, "centered cube transform + texture crops")
+		check(label .. "_inside_node", inside, "centered cube transform")
+		check(label .. "_one_drawn_face", single_face == #boxes,
+			single_face .. "/" .. #boxes .. " entities draw exactly one face")
 	end
 
 	audit("render_full")

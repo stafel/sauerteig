@@ -242,6 +242,104 @@ local function test_mesher()
 end
 
 -------------------------------------------------------------------------------
+-- Drawable quads: no two coplanar overlapping (the edge z-fighting invariant)
+-------------------------------------------------------------------------------
+
+-- Each face box contributes exactly one drawn quad: its outward face. Two
+-- coplanar drawn quads that overlap would fight for the depth buffer, which is
+-- the flicker seen along chiselled edges.
+local function drawn_quad(box)
+	local x0, x1 = math.min(box.x0, box.x1), math.max(box.x0, box.x1)
+	local y0, y1 = math.min(box.y0, box.y1), math.max(box.y0, box.y1)
+	local z0, z1 = math.min(box.z0, box.z1), math.max(box.z0, box.z1)
+	local plane
+	if box.axis == 1 then
+		plane = (box.dir > 0) and x1 or x0
+	elseif box.axis == 2 then
+		plane = (box.dir > 0) and y1 or y0
+	else
+		plane = (box.dir > 0) and z1 or z0
+	end
+	local quad = {axis = box.axis, plane = plane}
+	if box.axis == 1 then
+		quad.u0, quad.u1, quad.v0, quad.v1 = y0, y1, z0, z1
+	elseif box.axis == 2 then
+		quad.u0, quad.u1, quad.v0, quad.v1 = x0, x1, z0, z1
+	else
+		quad.u0, quad.u1, quad.v0, quad.v1 = x0, x1, y0, y1
+	end
+	return quad
+end
+
+local function quads_clash(a, b)
+	if a.axis ~= b.axis or not near(a.plane, b.plane, 1e-9) then
+		return false
+	end
+	local u = math.min(a.u1, b.u1) - math.max(a.u0, b.u0)
+	local v = math.min(a.v1, b.v1) - math.max(a.v0, b.v0)
+	return u > 1e-9 and v > 1e-9
+end
+
+local function count_coplanar_clashes(grid)
+	local boxes = M.build_surface_boxes(grid, M.create_palette({"a:stone"}), open_neighbors(), R)
+	local quads = {}
+	for _, box in ipairs(boxes) do
+		quads[#quads + 1] = drawn_quad(box)
+	end
+	local clashes = 0
+	for i = 1, #quads do
+		for j = i + 1, #quads do
+			if quads_clash(quads[i], quads[j]) then
+				clashes = clashes + 1
+			end
+		end
+	end
+	return clashes, #quads
+end
+
+local function test_drawable_quads()
+	local clashes = count_coplanar_clashes(M.create_filled_grid(1))
+	check("quads_full", clashes == 0, clashes .. " coplanar overlaps")
+
+	local corner = M.create_filled_grid(1)
+	M.fill_box(corner, 1, 1, 1, 8, 8, 8, 0)
+	clashes = count_coplanar_clashes(corner)
+	check("quads_corner_carve", clashes == 0, clashes .. " coplanar overlaps")
+
+	local cavity = M.create_filled_grid(1)
+	M.set_voxel(cavity, 8, 8, 8, 0)
+	M.set_voxel(cavity, 9, 8, 8, 0)
+	clashes = count_coplanar_clashes(cavity)
+	check("quads_cavity", clashes == 0, clashes .. " coplanar overlaps")
+
+	local shelf = M.create_empty_grid()
+	M.fill_box(shelf, 1, 8, 1, R, 8, R, 1)
+	clashes = count_coplanar_clashes(shelf)
+	check("quads_thin_shelf", clashes == 0, clashes .. " coplanar overlaps")
+
+	-- And the rendered texture table must draw exactly that one quad.
+	local boxes = M.build_surface_boxes(M.create_filled_grid(1),
+		M.create_palette({"a:stone"}), open_neighbors(), R)
+	local texture_ok = true
+	for _, box in ipairs(boxes) do
+		local textures = M.face_textures(box)
+		local visible = M.cube_face(box.axis, box.dir)
+		for i = 1, 6 do
+			if i == visible then
+				if type(textures[i]) ~= "string"
+					or not textures[i]:find("^%[combine:") then
+					texture_ok = false
+				end
+			elseif textures[i] ~= M.HIDDEN_TEXTURE then
+				texture_ok = false
+			end
+		end
+	end
+	check("quads_one_drawn_face", texture_ok,
+		"each face entity draws exactly its outward quad")
+end
+
+-------------------------------------------------------------------------------
 -- Picking
 -------------------------------------------------------------------------------
 
@@ -503,6 +601,7 @@ core.after(2.0, function()
 		{"palette", test_palette},
 		{"transforms", test_transforms},
 		{"mesher", test_mesher},
+		{"drawable", test_drawable_quads},
 		{"picking", test_picking},
 		{"brushes", test_brushes},
 		{"editing", test_editing},
