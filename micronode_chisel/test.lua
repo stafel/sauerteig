@@ -458,13 +458,15 @@ local function test_editing()
 	check("edit_palette_after_compact", #block.palette == M.MAX_MATERIALS,
 		"palette always reports four slots")
 
-	-- Undo restores the pre-carve grid.
+	-- Undo restores the pre-carve grid. A region carve that removes everything
+	-- also removes the container node (see remove_if_empty).
 	local before = M.compress_grid(M.get_block(TEST_POS).grid)
 	M.apply_region(TEST_POS, M.ordered_region(0, 0, 0, R - 1, R - 1, R - 1), nil,
 		{create = false, player = "mn_test"})
-	check("edit_apply_region", M.is_empty(M.get_block(TEST_POS).grid), "region carve empties the block")
+	check("edit_apply_region", not M.is_micronode_block(TEST_POS),
+		"a region carve that empties the block removes it")
 	local ok, restored = M.undo("mn_test")
-	check("edit_undo", ok and restored >= 1
+	check("edit_undo", ok and restored >= 1 and M.is_micronode_block(TEST_POS)
 			and M.compress_grid(M.get_block(TEST_POS).grid) == before,
 		"undo restored the previous grid")
 
@@ -610,9 +612,98 @@ local function fake_player(name)
 	}
 end
 
+-- Minimal InventoryRef stand-in: only what the border-push cost uses.
+-- Engine ItemStacks are userdata, so nothing here may assume a Lua table.
+local function fake_inventory(items)
+	local counts = {}
+	for item, count in pairs(items or {}) do
+		counts[item] = count
+	end
+	local inv = {}
+
+	local function amount(stack)
+		if not stack then
+			return nil, 1
+		end
+		local name = nil
+		if stack.get_name then
+			name = stack:get_name()
+		end
+		local count = 1
+		if stack.get_count then
+			count = stack:get_count() or 1
+		end
+		return name, count
+	end
+
+	function inv:contains_item(_, stack)
+		local name, count = amount(stack)
+		return name ~= nil and (counts[name] or 0) >= count
+	end
+
+	function inv:remove_item(_, stack)
+		local name, count = amount(stack)
+		if not name then
+			return
+		end
+		counts[name] = math.max(0, (counts[name] or 0) - count)
+	end
+
+	function inv:add_item(_, stack)
+		local name, count = amount(stack)
+		if name then
+			counts[name] = (counts[name] or 0) + count
+		end
+		return stack
+	end
+
+	function inv:count(name)
+		return counts[name] or 0
+	end
+
+	return inv
+end
+
+local function player_with_inventory(name, items)
+	local player = fake_player(name)
+	player.inv = fake_inventory(items)
+	player.get_inventory = function(self)
+		return self.inv
+	end
+	return player
+end
+
+-- Force a specific creative state for one player. The test world's own
+-- creative_mode is irrelevant: fake players are not real players, so the
+-- engine's check cannot answer for them.
+local function with_creative_state(creative, name, body)
+	local original = core.is_creative_enabled
+	core.is_creative_enabled = function(who)
+		if who == name then
+			return creative
+		end
+		if original then
+			return original(who)
+		end
+		return creative
+	end
+	local ok, err = pcall(body)
+	core.is_creative_enabled = original
+	if not ok then
+		error(err)
+	end
+end
+
+local function with_survival(name, body)
+	with_creative_state(false, name, body)
+end
+
+local function with_creative(name, body)
+	with_creative_state(true, name, body)
+end
+
 local function test_brush_sizes_apply()
 	core.load_area(TEST_POS)
-	M.set_player_grid_size("mn_size_test", 4)
 	local stone = M.fallback_material or M.get_fallback_material()
 	core.set_node(TEST_POS, {name = stone})
 	M.chisel_native(TEST_POS)
@@ -626,21 +717,38 @@ local function test_brush_sizes_apply()
 	end
 	clear_above()
 
-	local ok = M.edit_at(fake_player("mn_size_test"), TEST_POS, "push",
-		M.player_grid_size("mn_size_test"), nil)
-	local filled = M.get_block(above)
-	check("size_push_4", ok and filled ~= nil and M.count_solid(filled.grid) == 64,
-		filled and ("4x4x4 push filled " .. M.count_solid(filled.grid) .. " cells")
-			or "no block created above")
-
+	-- The top face of a full block is flush with the node border: pushing it
+	-- creates a node above, which a creative player does not pay for.
+	local ok = M.edit_at(fake_player("mn_size_test"), TEST_POS, "push", 1, nil)
+	check("size_push_border_allowed", ok and M.is_micronode_block(above),
+		"a border push creates the neighbouring block")
+	check("size_push_border_no_cost", true, "creative players pay nothing")
 	clear_above()
-	M.set_player_grid_size("mn_size_test", 1)
-	ok = M.edit_at(fake_player("mn_size_test"), TEST_POS, "push",
-		M.player_grid_size("mn_size_test"), nil)
-	filled = M.get_block(above)
-	check("size_push_1", ok and filled ~= nil and M.count_solid(filled.grid) == 1,
-		filled and ("1x1x1 push filled " .. M.count_solid(filled.grid) .. " cells")
-			or "no block created above")
+
+	-- Carve the top half so the next pushes hit an interior face and stay
+	-- inside the node, whatever the grid step.
+	M.api_fill_box(TEST_POS, 1, 9, 1, R, R, R, "air")
+
+	local function push_cells(gs)
+		M.set_player_grid_size("mn_size_test", gs)
+		local before = M.count_solid(M.get_block(TEST_POS).grid)
+		local pushed = M.edit_at(fake_player("mn_size_test"), TEST_POS, "push",
+			M.player_grid_size("mn_size_test"), nil)
+		local after = M.count_solid(M.get_block(TEST_POS).grid)
+		return pushed, after - before
+	end
+
+	local pushed, added = push_cells(4)
+	check("size_push_4", pushed and added == 64,
+		"a 4-micronode push adds 4x4x4 = " .. added .. " cells")
+
+	M.undo("mn_size_test")
+	pushed, added = push_cells(1)
+	check("size_push_1", pushed and added == 1,
+		"a 1-micronode push adds " .. added .. " cell(s)")
+
+	check("size_push_stays_in_node", not M.is_micronode_block(above),
+		"an interior push never creates a neighbouring node")
 
 	clear_above()
 	M.remove_block_entities(TEST_POS)
@@ -648,6 +756,210 @@ local function test_brush_sizes_apply()
 	core.remove_node(TEST_POS)
 	M.forget_player("mn_size_test")
 	M.set_player_grid_size("mn_size_test", 1)
+end
+
+-------------------------------------------------------------------------------
+-- Border push cost, empty blocks and open-face prevention
+-------------------------------------------------------------------------------
+
+local function test_border_and_empty()
+	core.load_area(TEST_POS)
+	local name = "mn_border_test"
+	local stone = M.fallback_material or M.get_fallback_material()
+	local above = {x = TEST_POS.x, y = TEST_POS.y + 1, z = TEST_POS.z}
+
+	local function clean(pos)
+		M.remove_block_entities(pos)
+		M.forget_block(pos)
+		core.remove_node(pos)
+	end
+	clean(TEST_POS)
+	clean(above)
+
+	core.set_node(TEST_POS, {name = stone})
+	M.chisel_native(TEST_POS)
+	M.refresh_block(TEST_POS)
+
+	-- A survival player pays one node of the pushed material per created block.
+	with_survival(name, function()
+		-- No stock: the border push is refused and creates nothing.
+		local broke = player_with_inventory(name, {})
+		local ok, why = M.edit_at(broke, TEST_POS, "push", 1, stone)
+		check("border_push_broke_refused",
+			not ok and not M.is_micronode_block(above), tostring(why))
+
+		-- Two nodes in stock: the push works and consumes exactly one.
+		local payer = player_with_inventory(name, {[stone] = 2})
+		ok, why = M.edit_at(payer, TEST_POS, "push", 1, stone)
+		check("border_push_paid", ok and M.is_micronode_block(above),
+			tostring(why))
+		check("border_push_consumed_one", payer.inv:count(stone) == 1,
+			"inventory now holds " .. payer.inv:count(stone))
+		clean(above)
+
+		-- Pushing into an *existing* chiseled neighbour creates no node, so it
+		-- costs nothing even with an empty inventory.
+		core.set_node(above, {name = stone})
+		M.chisel_native(above)
+		M.refresh_block(above)
+		-- Carve a bit away so the neighbour stays non-empty (a fully carved
+		-- block is removed from the map now).
+		M.api_fill_box(above, 1, 1, 1, R, 1, R, "air")
+		local free = player_with_inventory(name, {})
+		ok, why = M.edit_at(free, TEST_POS, "push", R, nil)
+		check("border_push_into_chiseled_free", ok
+				and free.inv:count(stone) == 0
+				and M.count_solid(M.get_block(above).grid) == M.VOXEL_COUNT,
+			(ok and (M.count_solid(M.get_block(above).grid) .. " cells above")
+				or tostring(why)))
+		clean(above)
+	end)
+
+	-- A creative player with an empty inventory is never charged.
+	local creative = player_with_inventory(name, {})
+	with_creative(name, function()
+		local ok, creative_why = M.edit_at(creative, TEST_POS, "push", 1, stone)
+		check("border_push_creative_free",
+			ok and creative.inv:count(stone) == 0,
+			(ok and ("inventory holds " .. creative.inv:count(stone))
+				or tostring(creative_why)))
+	end)
+	clean(above)
+
+	-- Drop the undo history accumulated by the pushes above.
+	M.forget_player(name)
+
+	-- Carving the last solid cell away removes the node instead of leaving an
+	-- invisible container behind.
+	M.apply_region(TEST_POS, M.ordered_region(0, 0, 0, R - 1, R - 1, R - 1), nil,
+		{create = false, player = name})
+	check("carve_empty_removes_node", not M.is_micronode_block(TEST_POS),
+		"a fully carved block is gone from the map")
+	check("carve_empty_undo_restores", M.undo(name) and M.is_micronode_block(TEST_POS)
+			and M.count_solid(M.get_block(TEST_POS).grid) > 0,
+		"undo brings the carved block back")
+
+	-- An already empty block in a saved world is cleaned up too.
+	M.remove_block_entities(TEST_POS)
+	core.set_node(TEST_POS, {name = M.BLOCK_NODE_OPEN})
+	M.set_block(TEST_POS, M.create_block_data(stone, M.create_palette({stone}),
+		M.create_empty_grid()))
+	check("remove_if_empty_direct", M.remove_if_empty(TEST_POS)
+			and not M.is_micronode_block(TEST_POS),
+		"remove_if_empty deletes an empty container")
+	check("remove_if_empty_noop", not M.remove_if_empty(TEST_POS),
+		"nothing to remove on a non-container")
+
+	-- Copying an empty block is refused rather than producing a useless
+	-- blueprint.
+	M.forget_clipboard(name)
+	core.set_node(TEST_POS, {name = M.BLOCK_NODE_OPEN})
+	M.set_block(TEST_POS, M.create_block_data(stone, M.create_palette({stone}),
+		M.create_empty_grid()))
+	local copied, copy_message = M.copy_block(name, TEST_POS)
+	check("copy_empty_refused", not copied and M.clipboard_is_empty(name),
+		tostring(copy_message))
+
+	for _, pos in ipairs({TEST_POS, above}) do
+		clean(pos)
+	end
+	M.forget_clipboard(name)
+	M.forget_player(name)
+end
+
+-- Removing geometry next to a chiseled block must re-mesh it, or the block
+-- keeps rendering with the faces it culled against the vanished neighbour.
+local function has_face(pos, axis, dir)
+	local block = M.get_block(pos)
+	if not block then
+		return false
+	end
+	local boxes = M.build_surface_boxes(block.grid, block.palette,
+		M.build_neighbors(pos), R)
+	for _, box in ipairs(boxes) do
+		if box.axis == axis and box.dir == dir then
+			return true
+		end
+	end
+	return false
+end
+
+-- Entities belonging to one block only. `get_objects_inside_radius` also
+-- returns the neighbour's render entities, so filter on the block position the
+-- spawn data carries.
+local function count_entities(pos)
+	local n = 0
+	for _, obj in ipairs(core.get_objects_inside_radius(pos, 1.6)) do
+		local lua = obj:get_luaentity()
+		if lua and lua.name == M.ENTITY_NAME and lua.block_pos
+			and lua.block_pos.x == pos.x and lua.block_pos.y == pos.y
+			and lua.block_pos.z == pos.z then
+			n = n + 1
+		end
+	end
+	return n
+end
+
+local function test_open_faces()
+	core.load_area(TEST_POS)
+	local stone = M.fallback_material or M.get_fallback_material()
+	local above = {x = TEST_POS.x, y = TEST_POS.y + 1, z = TEST_POS.z}
+
+	local function clean(pos)
+		M.remove_block_entities(pos)
+		M.forget_block(pos)
+		core.remove_node(pos)
+	end
+	clean(TEST_POS)
+	clean(above)
+
+	-- Two adjacent chiseled blocks, so the lower one culls its top face.
+	core.set_node(TEST_POS, {name = stone})
+	M.chisel_native(TEST_POS)
+	M.refresh_block(TEST_POS)
+	core.set_node(above, {name = stone})
+	M.chisel_native(above)
+	M.refresh_block(above)
+	-- A real placement goes through register_on_placenode; set_node does not,
+	-- so emulate the hook for the block that must react to the new neighbour.
+	M.remesh_neighbors(above)
+
+	check("open_faces_culled", not has_face(TEST_POS, 2, 1),
+		"the top face is culled against the solid neighbour")
+	local before = count_entities(TEST_POS)
+
+	-- Simulate digging the neighbour: the node goes away, then the neighbour
+	-- re-mesh (what core.register_on_dignode / after_destruct do) restores the
+	-- face.
+	M.remove_block_entities(above)
+	M.forget_block(above)
+	core.remove_node(above)
+	M.remesh_neighbors(above)
+
+	check("open_faces_restored", has_face(TEST_POS, 2, 1),
+		"the top face is visible again after the neighbour was removed")
+	check("open_faces_remeshed", count_entities(TEST_POS) > before,
+		before .. " -> " .. count_entities(TEST_POS) .. " entities")
+
+	-- Carving a neighbour down to nothingness removes it and re-meshes too.
+	core.set_node(above, {name = stone})
+	M.chisel_native(above)
+	M.refresh_block(above)
+	M.remesh_neighbors(above)
+	check("open_faces_culled_again", not has_face(TEST_POS, 2, 1),
+		"restoring the neighbour culls the face again")
+
+	M.apply_region(above, M.ordered_region(0, 0, 0, R - 1, R - 1, R - 1), nil,
+		{create = false, player = "mn_open_test"})
+	check("open_faces_neighbour_removed", not M.is_micronode_block(above),
+		"the carved neighbour is gone")
+	check("open_faces_restored_by_carve", has_face(TEST_POS, 2, 1),
+		"removing the neighbour by carving also restores the face")
+
+	M.forget_player("mn_open_test")
+	for _, pos in ipairs({TEST_POS, above}) do
+		clean(pos)
+	end
 end
 
 -------------------------------------------------------------------------------
@@ -883,6 +1195,43 @@ local function test_collision_shapes()
 	end)
 	check("collision_panel", panel.shape == "panel2_nx", panel.shape)
 
+	-- Corner stairs: a half-height slab plus either one raised quadrant (outer
+	-- corner) or all but one (inner corner). Four of each.
+	local CORNERS = {
+		{"nx", "nz", 0, 0}, {"px", "nz", HALF, 0},
+		{"nx", "pz", 0, HALF}, {"px", "pz", HALF, HALF},
+	}
+	for _, c in ipairs(CORNERS) do
+		local qx, qz, x0, z0 = c[1], c[2], c[3], c[4]
+		local outer = profile_of(function(grid)
+			M.fill_box(grid, 1, 1, 1, R, HALF, R, 1)
+			M.fill_box(grid, x0 + 1, HALF + 1, z0 + 1,
+				x0 + HALF, R, z0 + HALF, 1)
+		end)
+		check("collision_corner_" .. qx .. "_" .. qz,
+			outer.shape == "stair_corner_" .. qx .. "_" .. qz and outer.boxes == 2,
+			outer.shape .. " with " .. outer.boxes .. " box(es)")
+
+		local inner = profile_of(function(grid)
+			M.fill_box(grid, 1, 1, 1, R, HALF, R, 1)
+			M.fill_box(grid, 1, HALF + 1, 1, R, R, R, 1)
+			M.fill_box(grid, x0 + 1, HALF + 1, z0 + 1,
+				x0 + HALF, R, z0 + HALF, 0)
+		end)
+		check("collision_corner_l_" .. qx .. "_" .. qz,
+			inner.shape == "stair_corner_l_" .. qx .. "_" .. qz and inner.boxes == 3,
+			inner.shape .. " with " .. inner.boxes .. " box(es)")
+	end
+
+	-- A straight stair must still be recognised as a straight stair, not as the
+	-- corner whose single raised quadrant it contains (IoU 0.83 vs 1.0).
+	local straight = profile_of(function(grid)
+		M.fill_box(grid, 1, 1, 1, R, HALF, R, 1)
+		M.fill_box(grid, HALF + 1, HALF + 1, 1, R, R, R, 1)
+	end)
+	check("collision_straight_not_corner", straight.shape == "stair_px",
+		straight.shape)
+
 	local post = profile_of(function(grid)
 		M.fill_box(grid, HALF + 1, 1, HALF + 1, R, R, R, 1)
 	end)
@@ -1105,6 +1454,8 @@ core.after(2.0, function()
 		{"rendering", test_rendering},
 		{"sizes", test_grid_steps},
 		{"size_brush", test_brush_sizes_apply},
+		{"border", test_border_and_empty},
+		{"open_faces", test_open_faces},
 		{"budget", test_render_budget},
 		{"neighbors", test_neighbor_masks},
 		{"collision", test_collision_shapes},

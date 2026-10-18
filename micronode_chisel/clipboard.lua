@@ -97,11 +97,16 @@ function M.copy_block(name, pos)
 	end
 
 	local serialized = M.serialize_block_data(block)
+	local cells = M.count_solid(block.grid)
+	if cells == 0 then
+		return false, "That block is empty: nothing to copy"
+	end
+
 	local clip = M.get_clipboard(name)
 	clip.data = serialized.data
 	clip.palette = serialized.palette
 	clip.base = serialized.base
-	clip.cells = M.count_solid(block.grid)
+	clip.cells = cells
 	save(name, clip)
 
 	return true, string.format("Copied %d/%d micronodes (%s)",

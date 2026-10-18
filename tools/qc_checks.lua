@@ -38,6 +38,20 @@ local function box_key(box)
 	return string.format("%.6f:%.6f:%.6f:%.6f:%.6f:%.6f", box.x0, box.x1, box.y0, box.y1, box.z0, box.z1)
 end
 
+-- Render entities that belong to one block (neighbours are within the radius).
+local function block_entity_count(pos)
+	local n = 0
+	for _, obj in ipairs(core.get_objects_inside_radius(pos, 2.0)) do
+		local lua = obj:get_luaentity()
+		if lua and lua.name == M.ENTITY_NAME and lua.block_pos
+			and lua.block_pos.x == pos.x and lua.block_pos.y == pos.y
+			and lua.block_pos.z == pos.z then
+			n = n + 1
+		end
+	end
+	return n
+end
+
 -------------------------------------------------------------------------------
 print("[qc] data model")
 -------------------------------------------------------------------------------
@@ -501,6 +515,43 @@ do
 	check("collision_post", M.collision_profile(post).shape == "post_px_pz",
 		M.collision_profile(post).shape)
 
+	-- Corner stairs: one raised quadrant (outer) and all but one (inner).
+	local CORNERS = {
+		{"nx", "nz", 0, 0}, {"px", "nz", 8, 0},
+		{"nx", "pz", 0, 8}, {"px", "pz", 8, 8},
+	}
+	for _, c in ipairs(CORNERS) do
+		local qx, qz, x0, z0 = c[1], c[2], c[3], c[4]
+
+		local outer = M.create_empty_grid()
+		M.fill_box(outer, 1, 1, 1, R, 8, R, 1)
+		M.fill_box(outer, x0 + 1, 9, z0 + 1, x0 + 8, R, z0 + 8, 1)
+		local outer_profile = M.collision_profile(outer)
+		check("collision_corner_" .. qx .. "_" .. qz,
+			outer_profile.shape == "stair_corner_" .. qx .. "_" .. qz
+				and outer_profile.boxes == 2,
+			outer_profile.shape .. " " .. outer_profile.boxes .. " box(es)")
+
+		local inner = M.create_filled_grid(1)
+		M.fill_box(inner, 1, 1, 1, R, 8, R, 0)
+		M.fill_box(inner, 1, 9, 1, R, R, R, 1)
+		M.fill_box(inner, x0 + 1, 9, z0 + 1, x0 + 8, R, z0 + 8, 0)
+		local inner_profile = M.collision_profile(inner)
+		check("collision_corner_l_" .. qx .. "_" .. qz,
+			inner_profile.shape == "stair_corner_l_" .. qx .. "_" .. qz
+				and inner_profile.boxes == 3,
+			inner_profile.shape .. " " .. inner_profile.boxes .. " box(es)")
+	end
+
+	-- A straight stair contains a single raised quadrant, so it must still be
+	-- preferred over the corner shape (IoU 1.0 vs 0.83).
+	local straight = M.create_empty_grid()
+	M.fill_box(straight, 1, 1, 1, R, 8, R, 1)
+	M.fill_box(straight, 9, 9, 1, R, R, R, 1)
+	check("collision_straight_not_corner",
+		M.collision_profile(straight).shape == "stair_px",
+		M.collision_profile(straight).shape)
+
 	-- Unrecognised floor and ceiling sheets are anchored to a slab so they are
 	-- standable rather than walk-through.
 	local floor = M.create_empty_grid()
@@ -558,6 +609,70 @@ do
 	end
 	local per_call = (core.get_us_time() - start) / 1000 / 20
 	check("collision_perf", per_call < 5, string.format("%.2f ms", per_call))
+end
+
+-------------------------------------------------------------------------------
+print("[qc] border pushes, empty blocks and open faces")
+-------------------------------------------------------------------------------
+do
+	local pos = {x = 60, y = 10, z = 60}
+	local above = {x = 60, y = 11, z = 60}
+	core.remove_node(pos)
+	core.remove_node(above)
+	core.set_node(pos, {name = "default:stone"})
+	M.chisel_native(pos)
+
+	-- A brush on the top border spills into the neighbouring node.
+	local region = M.push_brush({x = 1, y = R, z = 1, nx = 0, ny = 1, nz = 0}, 1)
+	local blocker = M.region_spills_into_new_block(pos, region)
+	check("border_spill_detected", blocker ~= nil and blocker.y == above.y)
+
+	-- No spill when the target is already a chiseled block (nothing to pay for).
+	core.set_node(above, {name = "default:stone"})
+	M.chisel_native(above)
+	check("border_spill_existing", M.region_spills_into_new_block(pos, region) == nil)
+
+	-- The top face of the lower block is culled against the full neighbour.
+	local function has_top_face(p)
+		local block = M.get_block(p)
+		if not block then
+			return false
+		end
+		for _, box in ipairs(M.build_surface_boxes(block.grid, block.palette,
+			M.build_neighbors(p), R)) do
+			if box.axis == 2 and box.dir == 1 then
+				return true
+			end
+		end
+		return false
+	end
+	M.refresh_block(pos)
+	M.refresh_block(above)
+	M.remesh_neighbors(above)
+	check("open_faces_culled", not has_top_face(pos))
+	local culled = block_entity_count(pos)
+
+	-- Removing the neighbour must re-mesh the block, or the culled faces stay
+	-- holes. This is what after_destruct / register_on_dignode do.
+	M.remove_block_entities(above)
+	M.forget_block(above)
+	core.remove_node(above)
+	M.remesh_neighbors(above)
+	check("open_faces_restored", has_top_face(pos))
+	check("open_faces_remeshed", block_entity_count(pos) == culled + 1,
+		culled .. " -> " .. block_entity_count(pos) .. " entities")
+
+	-- Carving a block down to nothingness removes the node itself.
+	M.apply_region(pos, M.ordered_region(0, 0, 0, R - 1, R - 1, R - 1), nil,
+		{create = false})
+	check("empty_block_removed", not M.is_micronode_block(pos))
+
+	-- An empty container left by an older build is cleaned up too.
+	core.set_node(pos, {name = M.BLOCK_NODE_OPEN})
+	M.set_block(pos, M.create_block_data("default:stone",
+		M.create_palette({"default:stone"}), M.create_empty_grid()))
+	check("remove_if_empty", M.remove_if_empty(pos) and not M.is_micronode_block(pos))
+	check("remove_if_empty_noop", not M.remove_if_empty(pos))
 end
 
 -------------------------------------------------------------------------------

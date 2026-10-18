@@ -142,11 +142,21 @@ holds the catalogue and picks the variant:
 
 The catalogue is deliberately a fixed set of rudimentary forms rather than an
 arbitrary box decomposition: full/empty, bottom and top slabs at 1/8 steps
-(1/16-precision geometry snaps to the nearest), stairs in 4 orientations plus
-their inverted (ceiling) forms, walls/panels of 1/8, 1/4 and 1/2 thickness
-against a side, mid-node walls, and corner/centred posts. 45 shapes, i.e. 45
-registered container types (`micronode_chisel:shape_*`, plus the two historical
-names for `full` and `empty` so old worlds need no migration).
+(1/16-precision geometry snaps to the nearest), straight stairs in 4
+orientations plus their inverted (ceiling) forms, **corner stairs** (one raised
+quadrant = outer corner, 2 boxes; all but one = inner corner, 3 boxes),
+walls/panels of 1/8, 1/4 and 1/2 thickness against a side, mid-node walls, and
+corner/centred posts. 53 shapes, i.e. 53 registered container types
+(`micronode_chisel:shape_*`, plus the two historical names for `full` and
+`empty` so old worlds need no migration).
+
+Corner stairs are why `M.match_shape` must keep preferring the **highest IoU**
+and only use the box count as a tie-breaker: a single raised quadrant is
+geometrically a subset of a straight stair (IoU 0.83), so a "fewest boxes wins"
+rule would misclassify every straight stair as a corner. Symmetrically, the
+inner corner is *not* the complement of the outer one (a solid node minus a
+quadrant has IoU 0.22 with it), which is why both families are listed
+explicitly.
 
 Rules to preserve:
 
@@ -182,6 +192,58 @@ Invariants:
   `M.add_undo_position` → mutate → `M.commit_undo_entry`). Snapshotting after
   the paste records the new state and makes undo a no-op; that bug shipped once
   and is now covered by tests.
+
+### Border pushes cost a node
+
+A brush aimed at a face that sits on the node border reaches into the
+neighbouring node, so applying it creates a chiseled block there
+(`edit.lua: M.region_neighbour_blocks`). That is allowed, but it is charged:
+one node of the pushed material per block created
+(`M.can_pay_for_node` / `M.pay_for_node`), and creative players pay nothing
+(`core.is_creative_enabled`). Pushing into an *existing* chiseled neighbour
+creates nothing and is free.
+
+- The cost is computed from the split region, so a diagonal brush that touches
+  two empty neighbours is charged twice and rolls back completely when the
+  player cannot pay (checked before, paid after a successful apply).
+- Players without an inventory (the public API, tests, non-player callers) are
+  treated as creative rather than denied: an API caller must not need a fake
+  inventory to place a block.
+
+### Empty blocks are not nodes
+
+Carving the last solid cell away removes the container node
+(`edit.lua: M.remove_if_empty`), because an empty container is an invisible,
+walk-through node that still occupies the map and has to be dug away by hand.
+`mapblock` LBM also cleans up empties left behind by older builds.
+
+`remove_if_empty` is deliberately **not** called from `refresh_block`: undo and
+snapshot restore must be able to put an empty block back exactly as it was.
+Copying an empty block is refused for the same reason (the blueprint would be
+useless).
+
+### Open faces: who has to be re-meshed
+
+A block culls its faces against its neighbours (whole-face for a solid cube,
+per cell for a chiseled block), so **any** change on the other side of a shared
+boundary invalidates that culling. `edit.lua: M.remesh_neighbors(pos)` re-meshes
+the six neighbours that are chiseled blocks, and is called from:
+
+- `after_destruct` of the container (chiseled block dug or removed),
+- `core.register_on_dignode` (a plain node removed next to a block),
+- `core.register_on_placenode` (a plain node placed next to a block),
+- `M.remove_if_empty` (a neighbour carved to nothingness).
+
+Two engine facts decide where that call may live:
+
+1. `on_destruct` runs **before** the node is replaced with air
+   (`serverenvironment.cpp:636`). Re-meshing there makes neighbours cull
+   against a block that is about to vanish, i.e. it produces exactly the holes
+   it was meant to fix. Use `after_destruct(pos, oldnode)`.
+2. `core.set_node` / `core.swap_node` do **not** fire `register_on_placenode`.
+   Code that converts or places nodes directly must call
+   `M.remesh_neighbors` itself if the culling changes (converting a solid node
+   into a full chiseled block does not).
 
 ---
 
@@ -331,7 +393,10 @@ half → the remaining slab's face; empty grid → nil.
 | Crash `mesh.lua: attempt to compare number with nil` on any non-full block | The per-slice face mask is **sparse** (only exposed cells are stored), so `mask[...]` is `nil` for unexposed cells. `mat > 0` then compares nil. A fully solid block has a dense mask, which is why only slabs/carves crashed. Read masks as `mask[...] or 0` |
 | Shimmer / flicker along chiselled edges | Every face box drew all six of its quads, so a slab's side quad sat exactly in the neighbouring face box's outward plane — two opaque coplanar quads z-fighting. Fixed by drawing only the outward quad (§3) |
 | **Collision recognition never matched thin shapes** | The occupancy cell index was computed with a stray `+1` while the catalogue used a 0-based scheme. Full blocks still worked (fast path) and full-footprint shapes mostly cancelled the shift out, so only panels/posts/step shapes fell back to "empty". Caught by the shape tests; index both sides from the same formula |
+| **Corner stairs were never recognised** | The catalogue only had straight stairs, and a single raised quadrant is a subset of a straight stair, so the nearest match was "stair" by a wide margin. Fixed by adding the outer (one quadrant) and inner (all but one) corner families and keeping the highest IoU as the primary ranking criterion |
 | **Paste could not be undone** | The undo snapshot was taken *after* the block was replaced, so it recorded the pasted state. Snapshots must be taken before the mutation (§2, "Clipboard") |
+| **Neighbours kept holes after a node next to them was dug** | Nothing re-meshed them. Worse, the first attempt put the re-mesh in `on_destruct`, which runs while the node still exists, so the neighbours culled against it again. Re-mesh belongs in `after_destruct`, plus `register_on_dignode`/`register_on_placenode` for plain nodes (§2, "Open faces") |
+| **Carving a block to nothingness left an invisible node** | The container stayed behind, empty and walk-through, so the position had to be dug away manually. `M.remove_if_empty` now deletes it, and the mapblock LBM cleans up old worlds |
 | A crash in one self-test hid all later ones | The suites ran unwrapped in a single `core.after` callback, so the first error aborted the run. Each suite is now `pcall`ed and reported individually |
 | Process lesson | Never script a multi-part edit where one part can fail after another part was written. Run `python3 tools/headless_qc.py` before pushing — its strict-globals pass catches orphaned references, its render audit catches transform and crop regressions |
 
@@ -361,9 +426,16 @@ half → the remaining slab's face; empty grid → nil.
     volume (1³ vs 4³),
   - neighbour masks at both the full and the coarse stride,
   - collision shape recognition: full/empty fast paths, slabs at 1/8 snapping,
-    all four stair orientations with two boxes each, panels and posts, the
-    floor/ceiling safe fallback, every catalogue shape registered with the
-    matching `collision_box`, and a per-call cost budget,
+    all four straight stair orientations with two boxes each, all four outer
+    and all four inner corner stairs, straight-vs-corner disambiguation,
+    panels and posts, the floor/ceiling safe fallback, every catalogue shape
+    registered with the matching `collision_box`, and a per-call cost budget,
+  - border pushes: spill detection, survival cost (one node per created block,
+    refused when unaffordable) and creative being free,
+  - empty blocks: carve-to-nothingness removes the node, undo restores it, and
+    `remove_if_empty` handles containers left by older builds,
+  - open faces: a culled face comes back when its neighbour is removed, and the
+    neighbour is actually re-meshed (entity count grows by exactly one),
   - clipboard: copy → paste equality, rotated paste equals `rotate_grid`,
     conversion of plain nodes, liquid replacement, persisted rotation/flip,
     empty-clipboard refusal and undo of a paste,
@@ -380,6 +452,7 @@ half → the remaining slab's face; empty grid → nil.
 | Limitation | Impact | Path forward |
 |---|---|---|
 | Collision is a recognised shape, snapped to 1/8 node | A shape that matches no catalogue entry gets the safe fallback (floor/ceiling sheets become slabs, mid-node geometry uses the old 50 % rule), so carved detail below 12.5 cm collides as its snapped shape — up to one collision cell of invisible bulk, deliberately conservative so floors never open | Add catalogue entries for the shapes players actually build; engine support for per-node collision boxes |
+| Border pushes create a node in the neighbour position | Allowed and charged in survival, free in creative; a full inventory-less API caller is treated as creative | Multi-block brush with a single confirmation, or a placement preview |
 | Lighting is per node | A carved cavity still occludes sunlight as if solid | Engine micronode lighting (Phase 3 in `docs/subnode-editing-plan.md`) |
 | One entity per merged face | A chaotic carve can reach the budget (`micronode_chisel.max_render_boxes`, default 512) and then renders at a majority-coarsened downsample, which loses features smaller than a coarse cell but never turns the carve back into a full cube | Engine-side per-block mesh; raise the setting or set it to 0 while waiting |
 | 4 materials per block | Pushing a 5th material is refused with a message | Palette per face, or engine support |

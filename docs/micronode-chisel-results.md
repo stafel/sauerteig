@@ -94,6 +94,8 @@ Successfully implemented **Vintage Story-style micronode chiseling** for Luanti 
 - **Sneak + Left:** Cycle grid size (1/16, 1/8, 1/4, 1/2, 1/1)
 - **Right-click in air:** Open the chisel size menu (`/mn_menu`)
 - **Sneak + Aux1 + Left / Right:** Copy / paste a chiseled block (`/mn_copy`, `/mn_paste`)
+- **Carving a block fully empty:** removes the node instead of leaving an invisible one
+- **Pushing a face on the node border:** places the neighbouring node, costing one node in survival
 - **Sneak + Right:** Cycle material slot (1-4)
 - **Aux1 (E) + Left:** Rotate block 90°
 - **Right click (secondary):** Show block info

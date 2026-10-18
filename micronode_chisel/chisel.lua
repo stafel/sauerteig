@@ -203,6 +203,14 @@ local function container_def(description, walkable, nodeboxes)
 			M.forget_block(pos)
 		end,
 
+		-- MUST be after_destruct, not on_destruct: on_destruct runs while the
+		-- node is still there (serverenvironment.cpp:636), so neighbours would
+		-- re-mesh against the block that is about to vanish and keep their
+		-- faces culled - i.e. holes. Only here is the position really air.
+		after_destruct = function(pos)
+			M.remesh_neighbors(pos)
+		end,
+
 		-- Drop the base material instead of the invisible container node.
 		drop = "",
 
@@ -210,6 +218,8 @@ local function container_def(description, walkable, nodeboxes)
 			local base = drop_base(pos)
 			M.remove_block_entities(pos)
 			M.forget_block(pos)
+			-- core.remove_node runs after_destruct, which re-meshes the
+			-- neighbours that culled faces against this block.
 			core.remove_node(pos)
 			if digger and digger:is_player() then
 				local stack = ItemStack(base)
@@ -264,7 +274,8 @@ core.register_tool("micronode_chisel:chisel", {
 		"Sneak+Right: pick or cycle material\n" ..
 		"Aux1+Left: rotate, Aux1+Right: flip\n" ..
 		"Sneak+Aux1+Left: copy block\n" ..
-		"Sneak+Aux1+Right: paste block",
+		"Sneak+Aux1+Right: paste block\n" ..
+		"Pushing a border face places a neighbouring node (costs one node)",
 	inventory_image = "micronode_chisel_chisel.png",
 	groups = {chisel = 1},
 

@@ -25,10 +25,12 @@
 --      (>= 50 % solid = full cube, else no collision). See fallback_shape.
 --
 -- The catalogue is deliberately a fixed set of rudimentary forms (slabs,
--- stairs, panels, posts) at 1/8 node granularity: it is what players build,
--- each entry is a handful of boxes at most, and the whole thing costs one pass
--- over the 4096 cells plus a few dozen candidate scores - the same order as
--- the surface mesher (see docs/micronode-findings.md, "Collision").
+-- straight and corner stairs, panels, posts) at 1/8 node granularity: it is
+-- what players build, each entry is a handful of boxes at most, and the whole
+-- thing costs one pass over the 4096 cells plus a few dozen candidate scores -
+-- the same order as the surface mesher (see docs/micronode-findings.md,
+-- "Collision"). Adding a shape is cheap; adding a *parametric family* is not,
+-- because every distinct id is a registered node type sent to clients at join.
 
 local M = micronode_chisel
 local R = M.RESOLUTION
@@ -143,6 +145,37 @@ local function build_catalogue()
 		add_shape("stair_inv_" .. dir, {
 			bx(0, half, 0, last, last, last),
 			bx(r[1], 0, r[2], r[3], half - 1, r[4]),
+		})
+	end
+
+	-- Corner stairs: two stair runs meeting. The bottom half is always solid;
+	-- the upper half is a quadrant pattern, so the index names the +X/-X and
+	-- +Z/-Z side of the *quadrant* the id talks about:
+	--   stair_corner_<qx>_<qz>    one raised quadrant   (outer corner, 2 boxes)
+	--   stair_corner_l_<qx>_<qz>  all but that quadrant (inner corner, 3 boxes)
+	-- A single raised quadrant is geometrically a subset of a straight stair
+	-- (IoU 0.83), so recognition must keep preferring the higher IoU - see
+	-- M.match_shape.
+	local QUADRANTS = {
+		{"nx", "nz", 0, 0},
+		{"px", "nz", half, 0},
+		{"nx", "pz", 0, half},
+		{"px", "pz", half, half},
+	}
+	for _, q in ipairs(QUADRANTS) do
+		local qx, qz, x0, z0 = q[1], q[2], q[3], q[4]
+		add_shape("stair_corner_" .. qx .. "_" .. qz, {
+			bx(0, 0, 0, last, half - 1, last),
+			bx(x0, half, z0, x0 + half - 1, last, z0 + half - 1),
+		})
+		-- The L is every quadrant except this one: the opposite column is fully
+		-- raised, and only the non-notched half of this column is.
+		local ox = (x0 == 0) and half or 0
+		local oz = (z0 == 0) and half or 0
+		add_shape("stair_corner_l_" .. qx .. "_" .. qz, {
+			bx(0, 0, 0, last, half - 1, last),
+			bx(ox, half, 0, ox + half - 1, last, last),
+			bx(x0, half, oz, x0 + half - 1, last, oz + half - 1),
 		})
 	end
 

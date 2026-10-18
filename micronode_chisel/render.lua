@@ -178,6 +178,28 @@ end
 print("[micronode_chisel] Renderer loaded")
 
 -------------------------------------------------------------------------------
+-- Rebuild when the world changes around a block
+-------------------------------------------------------------------------------
+-- A chiseled block culls a face when the neighbouring node is a solid cube and,
+-- per cell, when a neighbouring chiseled block has solid cells there. Digging
+-- or placing a *plain* node next to a block therefore changes that block's
+-- geometry without any chisel edit taking place, and an un-refreshed block keeps
+-- rendering its old, culled-away faces (holes). These hooks re-mesh the six
+-- neighbours; they cost six node lookups and only do work when a neighbour is
+-- actually chiseled.
+--
+-- Chiseled blocks themselves never come through here for their own edits (the
+-- edit path re-meshes explicitly), and their removal is handled by on_destruct.
+
+core.register_on_dignode(function(pos)
+	M.remesh_neighbors(pos)
+end)
+
+core.register_on_placenode(function(pos)
+	M.remesh_neighbors(pos)
+end)
+
+-------------------------------------------------------------------------------
 -- Rebuild on mapblock activation
 -------------------------------------------------------------------------------
 
@@ -192,9 +214,15 @@ core.register_lbm({
 		-- the two legacy node types, and a new shape catalogue should apply
 		-- without an explicit migration.
 		local block = M.get_block(pos)
-		if block then
-			M.update_collision_node(pos, block)
+		if not block then
+			return
 		end
+		-- Older builds left fully carved blocks behind as invisible,
+		-- walk-through nodes. Clean them up on load.
+		if M.remove_if_empty(pos) then
+			return
+		end
+		M.update_collision_node(pos, block)
 		M.update_block_mesh(pos)
 	end,
 })

@@ -381,6 +381,46 @@ function M.refresh_block(pos)
 	M.update_block_mesh(pos)
 end
 
+-- A block with no solid cells left is not chiseled geometry: remove the
+-- container node entirely instead of leaving an invisible, walk-through node
+-- that still occupies the map position (and would need to be dug away).
+-- `core.remove_node` fires on_destruct (drop the render entities) and
+-- after_destruct (re-mesh the neighbours); the explicit calls here keep the
+-- behaviour identical when the caller already cleared the render cache.
+-- Deliberately *not* called from refresh_block: undo/restore must be able to
+-- put an empty block back exactly as it was.
+function M.remove_if_empty(pos)
+	local block = M.get_block(pos)
+	if not block or not M.is_empty(block.grid) then
+		return false
+	end
+	M.remove_block_entities(pos)
+	M.forget_block(pos)
+	core.remove_node(pos)
+	M.remesh_neighbors(pos)
+	return true
+end
+
+-- Re-mesh every chiseled block touching `pos`.
+--
+-- Face culling is per cell against the neighbour: a block drops the faces
+-- whose neighbouring cell is solid, so ANY change on the other side of a shared
+-- boundary invalidates the culled geometry. Whenever a node disappears or
+-- appears next to a chiseled block - a plain node dug or placed, or a chiseled
+-- block dug or carved to nothingness - the neighbour has to be re-meshed or it
+-- keeps rendering with holes where the removed geometry used to be.
+function M.remesh_neighbors(pos)
+	local remeshed = 0
+	for _, side in ipairs(M.SIDES) do
+		local npos = M.offset(pos, side.axis, side.dir)
+		if M.is_micronode_block(npos) then
+			M.update_block_mesh(npos)
+			remeshed = remeshed + 1
+		end
+	end
+	return remeshed
+end
+
 -------------------------------------------------------------------------------
 -- Regions and brushes
 -------------------------------------------------------------------------------
@@ -406,6 +446,125 @@ local function split_region(region, cb)
 	end
 end
 M.split_region = split_region
+
+-- Blocks other than the origin block that an absolute region touches.
+-- Each split block contributes one entry, so the result is small (a brush
+-- spans at most a handful of nodes).
+function M.region_neighbour_blocks(origin, region)
+	local out = {}
+	split_region(region, function(bx, by, bz)
+		if bx ~= 0 or by ~= 0 or bz ~= 0 then
+			out[#out + 1] = {x = origin.x + bx, y = origin.y + by, z = origin.z + bz}
+		end
+	end)
+	return out
+end
+
+-- Returns nil when the region only touches the origin block and existing
+-- chiseled blocks, or the first position where applying it would create a new
+-- chiseled node.
+function M.region_spills_into_new_block(origin, region)
+	for _, pos in ipairs(M.region_neighbour_blocks(origin, region)) do
+		if not M.is_micronode_block(pos) then
+			return pos
+		end
+	end
+	return nil
+end
+
+-------------------------------------------------------------------------------
+-- Paying for border pushes
+-------------------------------------------------------------------------------
+-- Pushing a face that sits on the node border creates a chiseled node in the
+-- neighbouring position, so the player is charged one node of the pushed
+-- material for it. Creative players pay nothing. Callers without an inventory
+-- (the public API, tests, a fake player) are treated like creative: they are
+-- not silently denied.
+
+local function player_inventory(player)
+	if not player or type(player.get_inventory) ~= "function" then
+		return nil
+	end
+	local ok, inv = pcall(player.get_inventory, player)
+	if ok then
+		return inv
+	end
+	return nil
+end
+
+local function is_creative(player)
+	local name = player and player.get_player_name and player:get_player_name()
+	if not name or not core.is_creative_enabled then
+		-- No creative switch (test stub): treat as creative so behaviour does
+		-- not depend on engine features being present.
+		return true
+	end
+	local ok, creative = pcall(core.is_creative_enabled, name)
+	return ok and creative == true
+end
+
+local function material_stack(material, count)
+	local stack = ItemStack(material)
+	if count and count > 1 and type(stack.set_count) == "function" then
+		stack:set_count(count)
+	end
+	return stack
+end
+
+-- Can this player afford to create `count` chiseled nodes of `material`?
+-- Returns true, or false plus a message.
+function M.can_pay_for_node(player, material, count)
+	count = math.max(1, count or 1)
+	if is_creative(player) then
+		return true
+	end
+	local inv = player_inventory(player)
+	if not inv then
+		return true
+	end
+	if M.is_air_name(material) then
+		return false, "no material selected"
+	end
+	if not inv:contains_item("main", material_stack(material, count)) then
+		return false, string.format("you need %d %s in your inventory",
+			count, material)
+	end
+	return true
+end
+
+-- Take `count` nodes of `material` from the player. Returns the number actually
+-- removed (0 in creative or without an inventory).
+function M.pay_for_node(player, material, count)
+	count = math.max(1, count or 1)
+	if is_creative(player) or M.is_air_name(material) then
+		return 0
+	end
+	local inv = player_inventory(player)
+	if not inv then
+		return 0
+	end
+	local paid = 0
+	for _ = 1, count do
+		if not inv:contains_item("main", ItemStack(material)) then
+			break
+		end
+		inv:remove_item("main", ItemStack(material))
+		paid = paid + 1
+	end
+	return paid
+end
+
+-- Give back nodes taken by M.pay_for_node (used when the edit failed).
+function M.refund_node(player, material, count)
+	if not count or count <= 0 or M.is_air_name(material) then
+		return
+	end
+	local inv = player_inventory(player)
+	if not inv then
+		return
+	end
+	inv:add_item("main", material_stack(material, count))
+end
 
 local function ordered_region(x0, y0, z0, x1, y1, z1)
 	return {
@@ -521,6 +680,9 @@ function M.apply_region(origin, region, material, opts)
 		M.fill_box(block.grid, lx0, ly0, lz0, lx1, ly1, lz1, mat_idx)
 		block.palette = M.palette_compact(block.grid, block.palette)
 		M.set_block(pos, block)
+		-- Carving the last solid cell away leaves an invisible, walk-through
+		-- node behind; remove it so the position is genuinely empty again.
+		M.remove_if_empty(pos)
 
 		changed[#changed + 1] = pos
 
@@ -751,10 +913,43 @@ function M.edit_at(player, pos, mode, gs, material)
 			return false, tostring(active) ..
 				" needs a free palette slot: this block already holds 4 materials"
 		end
+
+		-- A face flush with the node border pushes into the neighbouring node,
+		-- which means creating a new chiseled node there. That is allowed, but
+		-- it costs one node of the pushed material per block created (creative
+		-- pays nothing).
+		local missing = {}
+		for _, npos in ipairs(M.region_neighbour_blocks(pos, region)) do
+			if not M.is_micronode_block(npos) then
+				missing[#missing + 1] = npos
+			end
+		end
+		if #missing > 0 then
+			local ok, why = M.can_pay_for_node(player, active, #missing)
+			if not ok then
+				return false, why .. string.format(
+					" (that face is on the node border and would place %d new node(s))",
+					#missing)
+			end
+		end
+
 		local changed = M.apply_region(pos, region, active,
-			{create = true, base_material = active, player = name})
+			{create = #missing > 0, base_material = active, player = name})
 		if #changed == 0 then
-			return false, "nothing added: the neighbouring block is solid or protected"
+			return false, "nothing added: the target block is protected"
+		end
+		if #missing > 0 then
+			-- Charge only for the blocks that actually got created: a partly
+			-- protected brush may have skipped some of them.
+			local created = 0
+			for _, npos in ipairs(missing) do
+				if M.is_micronode_block(npos) then
+					created = created + 1
+				end
+			end
+			if created > 0 then
+				M.pay_for_node(player, active, created)
+			end
 		end
 		return true, #changed
 	end
