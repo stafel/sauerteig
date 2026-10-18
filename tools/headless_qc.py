@@ -166,13 +166,32 @@ def check_semantics(L, M):
                         continue
     # extents
     for f in faces:
-        if not (-0.5 - 1e-9 <= f.x0 <= f.x1 <= 0.5 + 1e-9 and
-                -0.5 - 1e-9 <= f.y0 <= f.y1 <= 0.5 + 1e-9 and
-                -0.5 - 1e-9 <= f.z0 <= f.z1 <= 0.5 + 1e-9):
-            fail(f"face out of node bounds: {f}")
-            break
+        for a in ("x", "y", "z"):
+            lo, hi = min(f[a + "0"], f[a + "1"]), max(f[a + "0"], f[a + "1"])
+            if not (-0.5 - 1e-9 <= lo and hi <= 0.5 + 1e-9):
+                fail(f"face out of node bounds on {a}: {lo}..{hi}")
+                break
     else:
         ok("all faces within node bounds")
+    # outward planes must sit exactly on the node boundary
+    planes = []
+    for f in faces:
+        for a in ("x", "y", "z"):
+            lo, hi = min(f[a+"0"], f[a+"1"]), max(f[a+"0"], f[a+"1"])
+            if abs(hi - lo) < 1e-9:  # paper-thin axis (should not happen now)
+                pass
+        planes.append(f)
+    outward = []
+    for f in faces:
+        for a in ("x", "y", "z"):
+            lo, hi = min(f[a+"0"], f[a+"1"]), max(f[a+"0"], f[a+"1"])
+            if abs(abs(lo) - 0.5) < 1e-9 or abs(abs(hi) - 0.5) < 1e-9:
+                if abs(hi - lo) <= 1/16 + 1e-9:  # depth axis
+                    outward.append((a, lo, hi))
+    if len(outward) < 6:
+        fail(f"expected >= 6 boundary faces for full block, got {len(outward)}")
+    else:
+        ok("full block has boundary faces on all sides with inward depth")
 
     # --- empty block -> 0 faces
     if len(M.generate_surface_faces(M.create_empty_grid(), L.table(), sides())) != 0:
@@ -185,7 +204,9 @@ def check_semantics(L, M):
     M.fill_box(grid, 1, 1, 1, 16, 8, 16, 1)
     faces = M.generate_surface_faces(grid, L.table("default:stone"), sides())
     faces = [faces[i] for i in range(1, len(faces) + 1)]
-    tops = [f for f in faces if abs(f.y0 - 0.0) < 1e-9 and abs(f.y1) < 1e-9 and (f.x1 - f.x0) > 0.9]
+    tops = [f for f in faces
+            if abs(max(f.y0, f.y1)) < 1e-9 and abs(min(f.y0, f.y1) + 1/16) < 1e-9
+            and (max(f.x1, f.x0) - min(f.x1, f.x0)) > 0.9]
     if len(faces) != 6 or len(tops) != 1:
         fail(f"half slab mesh: expected 6 faces with one full-area top, got {len(faces)} faces, {len(tops)} tops")
     else:

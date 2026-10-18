@@ -340,19 +340,27 @@ function M.generate_surface_faces(grid, palette, solid_outside, res)
 									visited[uu][vv] = true
 								end
 							end
-							-- paper-thin box on the face plane
-							local plane = dir > 0 and nb1(s) or nb0(s)
+							-- Box on the face plane extended one voxel deep
+							-- INTO the solid: the face quad gets the full voxel
+							-- depth so adjoining faces/quads overlap inside the
+							-- shape and the block reads as one continuous solid
+							-- (no seams or split-part look). The overlap is
+							-- hidden inside the shape; the outside surface planes
+							-- stay exact.
+							local depth = 1 / R
+							local p0 = dir > 0 and nb1(s) or nb0(s)
+							local p1 = dir > 0 and (p0 - depth) or (p0 + depth)
 							local rect = nil
 							if axis == 1 then
-								rect = {x0 = plane, x1 = plane,
+								rect = {x0 = p0, x1 = p1,
 									y0 = nb0(u), y1 = nb1(u2),
 									z0 = nb0(v), z1 = nb1(v2)}
 							elseif axis == 2 then
-								rect = {y0 = plane, y1 = plane,
+								rect = {y0 = p0, y1 = p1,
 									x0 = nb0(u), x1 = nb1(u2),
 									z0 = nb0(v), z1 = nb1(v2)}
 							else
-								rect = {z0 = plane, z1 = plane,
+								rect = {z0 = p0, z1 = p1,
 									x0 = nb0(u), x1 = nb1(u2),
 									y0 = nb0(v), y1 = nb1(v2)}
 							end

@@ -134,9 +134,13 @@ end
 local FACE_EPSILON = 1 / 64
 
 local function spawn_box(pos, box, texture)
-	local sx = math.max(box.x1 - box.x0, FACE_EPSILON)
-	local sy = math.max(box.y1 - box.y0, FACE_EPSILON)
-	local sz = math.max(box.z1 - box.z0, FACE_EPSILON)
+	-- extents may be reversed (inward-deep faces); normalize to min/max
+	local x0, x1 = math.min(box.x0, box.x1), math.max(box.x0, box.x1)
+	local y0, y1 = math.min(box.y0, box.y1), math.max(box.y0, box.y1)
+	local z0, z1 = math.min(box.z0, box.z1), math.max(box.z0, box.z1)
+	local sx = math.max(x1 - x0, FACE_EPSILON)
+	local sy = math.max(y1 - y0, FACE_EPSILON)
+	local sz = math.max(z1 - z0, FACE_EPSILON)
 	-- Anchor calibration: the cube visual's anchor point. "corner" places the
 	-- entity at the box's min corner and the cube extends +size from it
 	-- (matches observed 5.17.0 rendering); "center" places it at the box
@@ -146,11 +150,11 @@ local function spawn_box(pos, box, texture)
 	local origin
 	if anchor == "center" then
 		origin = vector.add(pos, vector.new(
-			(box.x0 + box.x1) / 2 + 0.5,
-			(box.y0 + box.y1) / 2 + 0.5,
-			(box.z0 + box.z1) / 2 + 0.5))
+			(x0 + x1) / 2 + 0.5,
+			(y0 + y1) / 2 + 0.5,
+			(z0 + z1) / 2 + 0.5))
 	else
-		origin = vector.add(pos, vector.new(box.x0 + 0.5, box.y0 + 0.5, box.z0 + 0.5))
+		origin = vector.add(pos, vector.new(x0 + 0.5, y0 + 0.5, z0 + 0.5))
 	end
 	local data = core.write_json({
 		block_pos = {x = pos.x, y = pos.y, z = pos.z},
