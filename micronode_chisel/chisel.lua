@@ -216,67 +216,79 @@ function M.get_block_info(pos)
 end
 
 ------------------------------------------------------------------------------
--- Map the exact look-ray hit on a block face to micronode coordinates
--- (1..M.RESOLUTION). pointed_thing only carries integer node positions, so
--- raycast from the player's eye to obtain the precise intersection point.
+-- Load the current voxel grid of a chiseled block
+local function block_grid(pos)
+	local meta = core.get_meta(pos)
+	local data_str = meta:get_string(M.META_KEY_DATA)
+	if data_str == "" then return nil end
+	local block_data = M.deserialize_block_data({
+		data = data_str,
+		palette = meta:get_string(M.META_KEY_PALETTE),
+		rotation = meta:get_string(M.META_KEY_ROTATION),
+		base = meta:get_string(M.META_KEY_BASE),
+	})
+	return block_data.grid
+end
+
 -- Voxel DDA picking through the block's 16^3 micronode grid (Cube 2 style:
--- the edit lands on the exact micronode surface under the cursor).
--- Returns: mx, my, mz (solid micronode hit), fx, fy, fz (face normal axis
--- signs: the air side the ray entered from)
+-- the edit lands on the exact micronode surface under the cursor, not on the
+-- node boundary box).
+-- Returns: mx, my, mz (solid micronode hit), fx, fy, fz (unit face normal
+-- pointing to the air side the ray came from)
 local function pick_micronode(pos, player, grid)
+	if not grid then return nil end
 	local eye = vector.add(player:get_pos(), vector.new(0, 1.475, 0))
 	local dir = player:get_look_dir()
-	local origin = vector.subtract(eye, pos)  -- block-relative
-
 	local R = M.RESOLUTION
-	-- normalize to voxel space
-	local o = vector.multiply(origin, R)
-	local d = vector.multiply(dir, 0.000001)
-	d = vector.multiply(dir, R)
 
-	-- current voxel (may be outside the block; clamp/DDA will handle it)
-	local cx = math.floor(o.x) + 1
-	local cy = math.floor(o.y) + 1
-	local cz = math.floor(o.z) + 1
+	-- block-relative position in voxel units, 1-based voxel indices:
+	-- voxel i covers [(i-1)/R, i/R)
+	local o = {
+		x = (eye.x - pos.x) * R,
+		y = (eye.y - pos.y) * R,
+		z = (eye.z - pos.z) * R,
+	}
+	local d = {x = dir.x * R, y = dir.y * R, z = dir.z * R}
 
-	local step = vector.new(
-		d.x > 0 and 1 or -1,
-		d.y > 0 and 1 or -1,
-		d.z > 0 and 1 or -1)
-
-	local function side_dist(c, dc, sc)
-		if dc == 0 then return math.huge end
-		local edge = sc > 0 and c or c + 1
-		return (edge - c) / dc
+	local c = {x = math.floor(o.x) + 1, y = math.floor(o.y) + 1, z = math.floor(o.z) + 1}
+	local step = {
+		x = d.x > 0 and 1 or -1,
+		y = d.y > 0 and 1 or -1,
+		z = d.z > 0 and 1 or -1,
+	}
+	local delta = {
+		x = d.x ~= 0 and math.abs(1 / d.x) or math.huge,
+		y = d.y ~= 0 and math.abs(1 / d.y) or math.huge,
+		z = d.z ~= 0 and math.abs(1 / d.z) or math.huge,
+	}
+	local function t_max(axis)
+		if d[axis] == 0 then return math.huge end
+		local boundary = step[axis] > 0 and c[axis] or c[axis] - 1
+		return (boundary - o[axis]) / d[axis]
 	end
+	local t = {x = t_max("x"), y = t_max("y"), z = t_max("z")}
 
-	local tx = side_dist(cx, d.x, step.x)
-	local ty = side_dist(cy, d.y, step.y)
-	local tz = side_dist(cz, d.z, step.z)
-
-	local max_steps = 256
-	for _ = 1, max_steps do
-		-- inside the block?
-		if cx >= 1 and cx <= R and cy >= 1 and cy <= R and cz >= 1 and cz <= R then
-			if M.get_voxel(grid, cx, cy, cz) > 0 then
-				local fx, fy, fz = 0, 0, 0
-				if tx <= ty and tx <= tz then fx = -step.x
-				elseif ty <= tz then fy = -step.y
-				else fz = -step.z end
-				return cx, cy, cz, fx, fy, fz
+	local face = {x = 0, y = 0, z = 0}
+	for _ = 1, 512 do
+		if c.x >= 1 and c.x <= R and c.y >= 1 and c.y <= R
+			and c.z >= 1 and c.z <= R then
+			if M.get_voxel(grid, c.x, c.y, c.z) > 0 then
+				return c.x, c.y, c.z, face.x, face.y, face.z
 			end
 		end
-		if tx <= ty and tx <= tz then
-			tx = tx + math.abs(1 / d.x)
-			cx = cx + step.x
-		elseif ty <= tz then
-			ty = ty + math.abs(1 / d.y)
-			cy = cy + step.y
+		local axis
+		if t.x <= t.y and t.x <= t.z then
+			axis = "x"
+		elseif t.y <= t.z then
+			axis = "y"
 		else
-			tz = tz + math.abs(1 / d.z)
-			cz = cz + step.z
+			axis = "z"
 		end
-		if tx > 1e9 and ty > 1e9 and tz > 1e9 then break end
+		if t[axis] == math.huge or t[axis] > 512 then return nil end
+		t[axis] = t[axis] + delta[axis]
+		c[axis] = c[axis] + step[axis]
+		face = {x = 0, y = 0, z = 0}
+		face[axis] = -step[axis]
 	end
 	return nil
 end
