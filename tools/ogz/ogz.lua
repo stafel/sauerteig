@@ -245,11 +245,13 @@ local function read_header(r)
 	end
 
 	if h.version <= 28 then
-		-- worldio.cpp:1013-1017 reads the pre-29 compatheader. Every shipped
-		-- Sauerbraten map is version 33, so fail loudly rather than silently
-		-- mis-parsing an ancient file.
+		-- worldio.cpp:1013-1017 reads the pre-29 compatheader, which also packs
+		-- the map's lighting settings inline. Out of scope on purpose: the
+		-- corpus we care about is v31+ and every v31+ file uses the modern
+		-- header, so supporting dead formats would only add untested paths.
 		r:fail(string.format(
-			"map version %d uses the pre-29 header; not supported yet", h.version))
+			"map version %d is older than 29 and not supported (supported: 29-33)",
+			h.version))
 	end
 
 	-- v30+: blendmap, numvars, numvslots (worldio.cpp:1022)
@@ -275,13 +277,19 @@ local function skip_vars(r, count)
 	end
 end
 
-local function read_entities(r, count)
+local function read_entities(r, count, entskip)
 	local ents = {}
 	for i = 1, count do
 		local x, y, z = r:f32(), r:f32(), r:f32()
 		local attrs = {r:i16(), r:i16(), r:i16(), r:i16(), r:i16()}
 		ents[i] = {x = x, y = y, z = z, attrs = attrs,
 			type = r:u8(), reserved = r:u8()}
+		-- A map saved by another game stores extra per-entity data
+		-- (worldio.cpp:1173-1180: when the game ident differs, the engine skips
+		-- `eif` bytes after every entity).
+		if entskip > 0 then
+			r:skip(entskip)
+		end
 	end
 	return ents
 end
@@ -440,12 +448,85 @@ local function intersects(leaf, region)
 end
 M.intersects = intersects
 
---- Octree -------------------------------------------------------------------
+--- Legacy node tail (map versions <= 31) -------------------------------------
 
 -- The engine keeps the map version in a global that every node reader consults
--- (`mapversion`, worldio.cpp:517-620) because the octree layout changed between
--- versions. Mirror that: one module-level value set by M.parse.
+-- (`mapversion`, worldio.cpp:517-620) because the node layout changed between
+-- versions. Mirror that: one module-level value, set by M.parse before any node
+-- is read. Declared here so both the legacy and the modern readers can see it.
 local mapversion = M.MAPVERSION
+
+-- worldio.cpp:496-499. The pre-33 material byte packs volume, clip and flags
+-- into 3/2/3 bits; convert it to the modern bitfield so downstream code has one
+-- representation.
+local function convert_old_material(mat)
+	local volume = mat % 8
+	local clip = math.floor(mat / 8) % 4
+	local flags = math.floor(mat / 32) % 8
+	return volume * 4 + clip * 32 + flags * 256
+end
+M.convert_old_material = convert_old_material
+
+-- Skip the pre-32 node tail and return material, merged.
+--
+-- Two structural differences from v32/33 (worldio.cpp:519-610):
+--   * a mask byte is ALWAYS present, and the material lives in its top bit
+--     rather than in the node tag;
+--   * surfaces are a fixed 16-byte `surfacecompat` record instead of a
+--     variable-length per-vertex block, but the loop bound grows: a face whose
+--     `layer` has bit 1 set appends an extra blended surface at index 6..11.
+local function read_legacy_node_tail(r, tag)
+	local mask = r:u8()
+
+	local material = M.MAT_AIR
+	if hasbit(mask, 7) then
+		material = convert_old_material(r:u8())
+	end
+
+	local merged = 0
+	if mask % 64 ~= 0 then                       -- mask & 0x3F: faces with data
+		local numsurfs = 6
+		local i = 0
+		while i < numsurfs do
+			if i >= 6 or hasbit(mask, i) then
+				local record = r:take(16)        -- surfacecompat
+				if i < 6 then
+					if hasbit(mask, 6) then      -- mask & 0x40: normals follow
+						-- normalscompat is `bvec normals[4]`, and bvec is
+						-- THREE bytes (x, y, z uchar) - geom.h:1273-1280.
+						-- Four bvecs are 12 bytes, not 4.
+						r:skip(12)
+					end
+					local layer = record:byte(16)
+					if math.floor(layer / 2) % 2 == 1 then
+						numsurfs = numsurfs + 1
+					end
+				end
+			end
+			i = i + 1
+		end
+	end
+
+	-- worldio.cpp:578-607: an old-style merge block may follow.
+	if mapversion >= 20 and hasbit(tag, 7) then
+		local merged_byte = r:u8()
+		merged = merged_byte % 64                 -- c.merged = merged & 0x3F
+		if hasbit(merged_byte, 7) then
+			local merge_mask = r:u8()
+			if merge_mask ~= 0 then
+				for i = 0, 5 do
+					if hasbit(merge_mask, i) then
+						r:skip(8)                -- mergecompat: 4 x u16
+					end
+				end
+			end
+		end
+	end
+
+	return material, merged
+end
+
+--- Octree -------------------------------------------------------------------
 
 local read_octree
 
@@ -466,7 +547,9 @@ read_octree = function(r, x, y, z, size, out, region)
 	local kind = tag % 8
 
 	if kind == OCTSAV_CHILDREN then
-		read_children(r, x, y, z, size, out, region)
+		-- worldio.cpp:507-509: children of a node of size S have size S/2.
+		-- `read_children`'s size argument is the CHILD size, so halve here.
+		read_children(r, x, y, z, math.floor(size / 2), out, region)
 		return
 	end
 
@@ -494,16 +577,26 @@ read_octree = function(r, x, y, z, size, out, region)
 	local texture = {}
 	for i = 1, 6 do texture[i] = r:u16() end
 
-	local material = M.MAT_AIR
-	if hasbit(tag, 6) then                  -- OCTSAV_MATERIAL
-		material = r:u16()
-	end
-	local merged = 0
-	if hasbit(tag, 7) then                  -- OCTSAV_MERGED
-		merged = r:u8()
-	end
-	if hasbit(tag, 5) then                  -- OCTSAV_SURFS
-		skip_surfaces(r)
+	local material, merged
+	if mapversion <= 31 then
+		material, merged = read_legacy_node_tail(r, tag)
+	else
+		-- worldio.cpp:611-723
+		material = M.MAT_AIR
+		merged = 0
+		if hasbit(tag, 6) then              -- OCTSAV_MATERIAL
+			if mapversion <= 32 then
+				material = convert_old_material(r:u8())
+			else
+				material = r:u16()
+			end
+		end
+		if hasbit(tag, 7) then              -- OCTSAV_MERGED
+			merged = r:u8()
+		end
+		if hasbit(tag, 5) then              -- OCTSAV_SURFS
+			skip_surfaces(r)
+		end
 	end
 
 	-- Interior leaves carry no geometry of their own; dropping them keeps the
@@ -606,10 +699,11 @@ function M.parse(data, region)
 	skip_vars(r, h.numvars)
 
 	local gametype = ""
+	local entity_extra = 0
 	if h.version >= 16 then
 		local name_len = r:u8()
 		gametype = r:take(name_len + 1):match("^[^%z]*") or ""
-		r:skip(2)                          -- eif: entity-extra-info size
+		entity_extra = r:u16()             -- eif: per-entity size of that game's
 		r:skip(r:u16())                    -- extras
 	end
 
@@ -620,8 +714,19 @@ function M.parse(data, region)
 		for i = 1, r:u16() do texture_mru[i] = r:u16() end
 	end
 
-	local entities = read_entities(r, h.numents)
+	local entities = read_entities(r, h.numents,
+		(gametype == "fps") and 0 or entity_extra)
 	skip_vslots(r, h.numvslots)
+
+	-- Diagnostics for a desync: where the octree started, so a "bad tag at
+	-- byte N" can be attributed to the header/entity region or to a node tail.
+	M.last_debug = {
+		gametype = gametype,
+		eif = entity_extra,
+		numents = h.numents,
+		numvslots = h.numvslots,
+		octree_start = r.pos,
+	}
 
 	local leaves = {}
 	read_children(r, 0, 0, 0, math.floor(h.worldsize / 2), leaves, region)

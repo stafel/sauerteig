@@ -31,8 +31,9 @@ core.after(0.2, function()
 		print("[ogz] FAIL loading selftest.lua: " .. tostring(selftest))
 		return
 	end
+	local ok3, compare = pcall(load_module, "compare.lua")
 
-	local ran, result = pcall(selftest, ogz, {})
+	local ran, result = pcall(selftest, ogz, {}, {compare = ok3 and compare or nil})
 	if not ran then
 		print("[ogz] FAIL selftest raised: " .. tostring(result))
 		return

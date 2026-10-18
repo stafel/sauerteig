@@ -8,8 +8,8 @@
 # Artifacts of the tools/ogz in-engine harness: world.mt at the repository root
 # makes the repo itself a throwaway Luanti world so the mod sandbox allows
 # reading both tools/ogz/*.lua and sauerbraten/packages/base/*.ogz.
-# Safe to delete; see docs/sauerbraten-port-plan.md, section 7a.
-/worldmods/
+# world.mt and worldmods/ogz_dev/ ARE committed - they are the harness. Only the
+# generated state below is ignored. See docs/sauerbraten-port-plan.md, 7a.
 /map.sqlite
 /map_meta.txt
 /mod_storage.sqlite

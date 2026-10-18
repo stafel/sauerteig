@@ -1,0 +1,65 @@
+Add an octree dump hook to load_world, for validating an external reader.
+
+Dumps every leaf as "<x> <y> <z> <size> <12 edge bytes as %02x> <6 texture
+slots> <material>" to the file named by $SAUER_DUMP_OCTREE, immediately after
+the octree has been validated. Coordinates are the engine's own (Z-up, origin at
+the world corner), and leaves are emitted in octant order, which is exactly what
+tools/ogz/ogz.lua claims to reproduce.
+
+Apply with: git apply tools/ogz/oracle/dumpoctree.patch   (from sauerbraten/)
+
+--- a/src/engine/worldio.cpp
++++ b/src/engine/worldio.cpp
+@@ -1000,6 +1000,43 @@
+ 
+ void clearmapcrc() { mapcrc = 0; }
+ 
++// --- oracle dump -----------------------------------------------------------
++// Test-only. Emits the octree in the exact coordinate space an external reader
++// must reproduce, so the two can be diffed leaf-for-leaf. Enabled by setting
++// $SAUER_DUMP_OCTREE to an output path; otherwise this is a no-op.
++static void dumpcube(cube *c, const ivec &o, int size, FILE *f)
++{
++    loopi(8)
++    {
++        cube &cu = c[i];
++        ivec co(i, o, size);              // co + bit(i) * size
++        if(cu.children)
++        {
++            dumpcube(cu.children, co, size >> 1, f);
++            continue;
++        }
++        fprintf(f, "%d %d %d %d", co.x, co.y, co.z, size);
++        loopj(12) fprintf(f, " %02x", cu.edges[j]);
++        loopj(6) fprintf(f, " %u", (unsigned)cu.texture[j]);
++        fprintf(f, " %u\n", (unsigned)cu.material);
++    }
++}
++
++static void dumpoctree(int worldsize)
++{
++    const char *path = getenv("SAUER_DUMP_OCTREE");
++    if(!path || !*path) return;
++    FILE *f = fopen(path, "w");
++    if(!f)
++    {
++        conoutf(CON_ERROR, "SAUER_DUMP_OCTREE: cannot open %s", path);
++        return;
++    }
++    dumpcube(worldroot, ivec(0, 0, 0), worldsize >> 1, f);
++    fclose(f);
++    conoutf("dumped octree to %s", path);
++}
++
+ bool load_world(const char *mname, const char *cname)        // still supports all map formats that have existed since the earliest cube betas!
+ {
+     int loadingstart = SDL_GetTicks();
+@@ -1210,6 +1247,8 @@
+     renderprogress(0, "validating...");
+     validatec(worldroot, hdr.worldsize>>1);
+ 
++    dumpoctree(hdr.worldsize);
++
+     if(!failed)
+     {
+         if(hdr.version >= 7) loopi(hdr.lightmaps)

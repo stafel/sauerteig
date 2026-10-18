@@ -325,53 +325,67 @@ first**, **patched server acceptable as a test-only oracle**.
 
 | Artifact | What it is |
 |---|---|
-| `tools/ogz/ogz.lua` | The reader: gzip framing, header, vars, game ident, texture MRU, entities, vslots, octree, lightmap/PVS/blendmap skip, leaf corner decode, region filter. Plain Lua 5.1 (no `bit`, no `//`, no `goto`) so it runs in-engine, under lupa, and in a stock interpreter |
-| `tools/ogz/selftest.lua` | Synthetic fixture (hand-built bytes covering every construct) + optional real-map layer |
-| `tools/ogz/world.mt` + `worldmods/ogz_selftest/` | Runs the synthetic layer inside the engine |
+| `tools/ogz/ogz.lua` | The reader: gzip framing, header, vars, game ident, texture MRU, entities, vslots, octree (v29–v33 layouts), lightmap/PVS/blendmap skip, leaf corner decode, region filter. Plain Lua 5.1 (no `bit`, no `//`, no `goto`) so it runs in-engine, under lupa, and in a stock interpreter |
+| `tools/ogz/selftest.lua` | Synthetic fixtures for **every supported version** (29–33) plus the real-map corpus layer |
+| `tools/ogz/compare.lua` | Oracle comparator: diffs an engine octree dump against our leaves |
+| `tools/ogz/corpus.txt` | The acceptance corpus (map names under `sauerbraten/packages/base`) |
+| `tools/ogz/world.mt` + `worldmods/ogz_selftest/` | Runs the synthetic layer in-engine |
+| `world.mt` + `worldmods/ogz_dev/` (repo root) | Runs the **corpus** in-engine; the world directory is the repo root because the sandbox only allows reads under world/mod/game/mod_data |
+| `tools/ogz/oracle/` | Option C patch + procedure (see below) |
 
-Two things that make this runnable at all, both now recorded because they cost
-real time to rediscover:
+Version policy: **v33 is the target**; v32 and v31 were cheap (a one-byte vs
+two-byte material, and a fixed-size legacy surface block) and buy 130 extra
+corpus maps, so v29–v33 are supported. Anything older is rejected with an
+explicit message rather than guessed at.
 
-* **The Lua sandbox forbids reading outside the world/mod/game/mod_data paths**
-  (`src/script/cpp_api/s_security.cpp:869-931`) and `secure.*` settings cannot be
-  set from Lua (`l_util`/`l_settings.cpp:39`). The way in is to make the *world
-  directory* the directory that contains the files you want to read. That needs
-  no `secure.trusted_mods` and no `--insecure-no-sandbox`.
+Two engine facts that make this runnable, both expensive to rediscover:
+
+* **The Lua sandbox forbids reading outside world/mod/game/mod_data**
+  (`src/script/cpp_api/s_security.cpp:869-931`) and a mod cannot set `secure.*`
+  (`l_settings.cpp:39`). The way in is to make the *world directory* contain the
+  files you want to read. No `secure.trusted_mods`, no `--insecure-no-sandbox`.
 * `core.decompress` has no gzip method, so `M.gunzip` parses the RFC 1952
-  framing and delegates only raw inflate (`opts.inflate_raw`). In-engine that is
+  framing and delegates only raw inflate (`opts.inflate_raw`); in-engine that is
   `core.decompress(bytes, "raw_deflate")`.
 
 ### Verified
 
-* Synthetic layer: 16 checks, all passing. It found **three real bugs**:
-  the missing second `u16` (`eif`) after the game ident, `read_children` using
-  half the child size, and inclusive-vs-half-open region bounds.
-* Real maps: `arbana`, `academy`, `complex`, `abbey` parse to **exactly** the
-  decompressed size (`stream_complete`), i.e. the header/vars/entity/vslot/
-  octree/lightmap/PVS/blendmap layout is right for version-33 files.
+* **Corpus: 171 of 171 supported maps parse with exact byte accounting and every
+  leaf inside the world; 34 pre-v29 maps skipped; 0 failures.**
+  That is 5,000,000+ leaves across the shipped map set.
+* Synthetic fixtures for v29, v30, v31, v32, v33: all pass, including the
+  constructs that real maps rarely exercise (`CHILDREN`, `LODCUBE`, the legacy
+  surface block with its self-growing record count, material/liquid decode).
 
-### Open defects in the reader (blocking M1)
+### Bugs the tests caught (all fixed)
 
-Measured on `sauerbraten/packages/base`:
+| Symptom | Cause |
+|---|---|
+| Pre-v29 maps "unknown var" | The header's `numvslots` field does not exist before v30 |
+| Desync right after the game ident | The engine reads **two** `u16`s (`eif` *and* `extrasize`), not one |
+| Leaves far outside the world (`x` up to 6× worldsize) while the byte count still matched | `CHILDREN` nodes were read with the parent's size; the engine gives children **half** the size. `stream_complete` alone could never catch this - the in-bounds assertion did |
+| `aard3c`, `aqueducts` desync | `normalscompat` is `bvec[4]` and `bvec` is **3 bytes** (`geom.h:1273`), so 12 bytes, not the 4 I assumed |
+| Region filter kept everything | Bounds documented inclusive but compared half-open |
 
-1. **Leaf bounds are impossible** on maps that otherwise complete the stream:
-   `arbana` (world 8192) yields leaves up to x = 49152; `abbey` (2048) up to
-   10240; `academy`/`complex` (1024) up to 3584. A silent misparse that still
-   consumes the same byte count, so `stream_complete` alone cannot catch it —
-   the bounds assertion does. Most likely candidate: the surface block's
-   per-vertex loop leaving the octree aligned only by coincidence, or a
-   depth-dependent offset error. **This is the next thing to fix**, and the
-   patched-server oracle (Option C) is the fastest way to localise it.
-2. **Pre-32 map versions are not implemented.** The corpus is not all v33:
-   `box_demo` is v24, `aard3c` v29, `aqueducts`/`canyon`/`curvy_castle`/
-   `c_egypt` v31. Versions ≤31 use an entirely different octree branch
-   (`surfacecompat`, `convertoldsurfaces`) and ≤32 a 1-byte material. Decision
-   needed: implement the legacy layouts, or restrict the tool to v32/33 and
-   convert only maps we author ourselves (which is the stated end goal anyway).
+### Oracle (Option C): written, not yet executed
 
-The bounds assertion and the explicit version check above are deliberately kept
-in the test rather than loosened: they are what turned "it parses" into "it
-parses correctly".
+`tools/ogz/oracle/` holds the patch and procedure. One finding changed the
+design: **`load_world` is client-only** (`worldio.cpp:172-1387` wraps it in
+`#ifndef STANDALONE`, and only `fpsgame/client.cpp` and `rpggame/rpg.cpp` call
+it), so the dedicated server never loads the octree at all. The oracle must
+therefore be a client build with a dump hook, run under a display (or xvfb) -
+a manual, test-only check rather than a CI dependency.
+
+This session had no shell and no display, so it was not built. The comparator
+itself *is* verified: `compare.lua` reproduces our leaves in the engine's dump
+format, asserts identity (0 differences) and asserts that a single corrupt edge
+byte is reported.
+
+Why it still matters despite a clean corpus: byte accounting cannot catch a
+*wrong but consistent* mapping (e.g. a transposed axis). A leaf-for-leaf diff
+against the engine pins the octant walk, child-size rule, corner decode inputs
+and material decode at once - which is exactly what M1's voxelizer will depend
+on.
 
 ---
 
