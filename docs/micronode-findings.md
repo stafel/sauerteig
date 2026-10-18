@@ -137,6 +137,7 @@ Per-face textures are produced in `entities.lua`:
 | Textures stretched/warped | Cube visual maps whole texture per face; no crop (§3) |
 | Open sides (invisible faces) | `[combine` blit offsets positive instead of negative |
 | Node "refills" at ~12% chiseled | Render-budget fallback spawned one full-block box |
+| Block completely invisible | crop_16 got reversed face extents (from inward depth): u0>u1 → blit outside canvas → transparent faces. crop must normalize the region first |
 | Block rendered as "split up parts" with seams | Face quads were paper-thin; faces only met edge-to-edge (no volume overlap) |
 | Rest of node invisible + floating top | Mesher read coarse grid with 16³ stride (§2 gotcha) |
 | Startup crash ×3 (`solid_outside_sides`, `block_grid`, `voxel` nil) | Multi-step patch scripts: a later step's `assert` failure rolled back part of an edit while another step's changes had already landed |
@@ -151,6 +152,14 @@ faces/quads overlap inside the shape and it reads as one continuous
 solid; the outward surface planes stay exact. Consequence: face boxes
 can have **reversed extents** (e.g. x: 0.5 → 0.4375); `spawn_box`
 normalizes min/max before computing size and origin.
+
+### Crop normalization (invisible-block bug)
+
+Inward face depth means face boxes can have reversed extents; BOTH
+consumers must normalize: `spawn_box` (min/max before size+origin) and
+`crop_16` (u/v region before pixel math). Missing the second made every
+face texture a blit landing fully outside its canvas → invisible block.
+The QC entity audit now catches this class end-to-end.
 
 **Process lesson**: every shipped crash class (orphaned reference) came
 from scripted multi-block edits. Rules:
