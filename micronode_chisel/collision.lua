@@ -1,62 +1,46 @@
--- Simplified AABB Collision for Micronode Blocks
--- For v1: Use full block collision or empty collision
--- For v2: Generate per-micronode AABB collision
+-- Collision behaviour of chiseled blocks.
+--
+-- A Luanti node carries exactly one collision box, so per-micronode collision
+-- cannot be expressed for a container node. The approximation used here:
+--
+--   solid cells >= COLLISION_SOLID_RATIO  -> M.BLOCK_NODE       (full block)
+--   otherwise                             -> M.BLOCK_NODE_OPEN  (no collision)
+--
+-- This makes carving a doorway usable (you carve more than half of the blocks
+-- and then walk through), at the cost of a mostly-empty block never blocking
+-- movement. Per-cell collision would need engine support (see
+-- docs/subnode-editing-plan.md, "Collision for micronodes").
+--
+-- Why a second node type instead of `walkable = false` on one type: walkability
+-- is a per-type property, so it cannot vary per placed block.
 
 local M = micronode_chisel
 
-------------------------------------------------------------------------------
--- Collision Selection
-------------------------------------------------------------------------------
+M.COLLISION_SOLID_RATIO = 0.5
 
--- Determine collision box type for a micronode block
--- Returns: "full" (solid block), "empty" (air), or "custom" (future)
-function M.get_collision_type(grid)
-	local solid_count = M.count_solid(grid)
+-- Solid fraction of a grid, 0..1.
+function M.fill_ratio(grid)
+	local volume = #grid
+	if volume <= 0 then
+		return 0
+	end
+	return M.count_solid(grid) / volume
+end
 
-	if solid_count == 0 then
-		return "empty"
-	elseif solid_count == M.VOXEL_COUNT then
-		return "full"
-	else
-		-- Partial: use full block collision for simplicity (v1)
-		-- TODO v2: Generate custom collision mesh
-		return "full"
+-- Container node name a block with this grid should use.
+function M.collision_variant(grid)
+	if M.fill_ratio(grid) >= M.COLLISION_SOLID_RATIO then
+		return M.BLOCK_NODE
+	end
+	return M.BLOCK_NODE_OPEN
+end
+
+-- Swap the container node to the variant matching the current grid.
+function M.update_collision_node(pos, block)
+	local want = M.collision_variant(block.grid)
+	if core.get_node(pos).name ~= want then
+		core.swap_node(pos, {name = want})
 	end
 end
 
--- Get collision boxes for a micronode block
--- v1: Simplified — full block or empty
-function M.get_collision_boxes(grid, palette)
-	local collision_type = M.get_collision_type(grid)
-
-	if collision_type == "empty" then
-		-- No collision (player can walk through)
-		return {}
-	else
-		-- Full block collision
-		return {
-			{
-				type = "regular",
-				fixed = {{-0.5, -0.5, -0.5, 0.5, 0.5, 0.5}},
-			}
-		}
-	end
-end
-
--- v2: Generate per-micronode collision (not implemented yet)
--- This would create AABBs for each solid micronode
-function M.get_detailed_collision_boxes(grid, palette)
-	local boxes = M.generate_optimized_nodeboxes(grid, palette)
-	local collision_boxes = {}
-
-	for _, box in ipairs(boxes) do
-		table.insert(collision_boxes, {
-			type = "regular",
-			fixed = {{box.x0, box.y0, box.z0, box.x1, box.y1, box.z1}},
-		})
-	end
-
-	return collision_boxes
-end
-
-print("[micronode_chisel] Collision loaded")
+print("[micronode_chisel] Collision model loaded")

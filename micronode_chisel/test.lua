@@ -1,468 +1,541 @@
--- Automated Tests for Micronode Chisel
--- Runs on server startup to verify functionality
+-- In-engine self tests, run shortly after server start.
+--
+-- These exercise the real code paths (mesher, picker, brushes, undo, entity
+-- spawning) rather than mocking them. The headless logic mirror is
+-- tools/headless_qc.py, which also runs the strict-globals check in CI; keep
+-- both in sync when changing behaviour.
+--
+-- Disable with `micronode_chisel.tests = false` in minetest.conf.
 
 local M = micronode_chisel
-local test_results = {}
+local R = M.RESOLUTION
 
-local function log_test(name, passed, msg)
-	local status = passed and "PASS" or "FAIL"
-	table.insert(test_results, {name = name, passed = passed, msg = msg})
-	print(string.format("[micronode_chisel TEST] %s: %s - %s", status, name, msg))
+local results = {}
+
+local function check(name, ok, detail)
+	results[#results + 1] = {name = name, ok = ok and true or false, detail = detail}
 end
 
-------------------------------------------------------------------------------
--- Test 1: Grid Creation and Basic Operations
-------------------------------------------------------------------------------
+local function near(a, b, eps)
+	return math.abs(a - b) <= (eps or 1e-6)
+end
 
-local function test_grid_basic()
-	-- Create empty grid
+local function sum_solid(grid)
+	return M.count_solid(grid)
+end
+
+-------------------------------------------------------------------------------
+-- Data
+-------------------------------------------------------------------------------
+
+local function test_data()
 	local grid = M.create_empty_grid()
-	local pass = (#grid == M.VOXEL_COUNT) and M.is_empty(grid)
-	log_test("grid_empty", pass, string.format("Created empty grid with %d voxels", #grid))
-	if not pass then return false end
+	check("data_empty", #grid == M.VOXEL_COUNT and M.is_empty(grid),
+		"empty grid has " .. #grid .. " cells")
 
-	-- Create filled grid
 	grid = M.create_filled_grid(1)
-	pass = M.is_full(grid) and (M.count_solid(grid) == M.VOXEL_COUNT)
-	log_test("grid_filled", pass, "Created filled grid")
-	if not pass then return false end
+	check("data_filled", M.is_full(grid) and M.count_solid(grid) == M.VOXEL_COUNT,
+		"filled grid")
 
-	-- Set and get voxel
 	grid = M.create_empty_grid()
 	M.set_voxel(grid, 8, 8, 8, 2)
-	pass = (M.get_voxel(grid, 8, 8, 8) == 2)
-	log_test("voxel_set_get", pass, "Set and get voxel at (8,8,8)")
+	check("data_set_get", M.get_voxel(grid, 8, 8, 8) == 2, "set/get voxel")
+	check("data_out_of_bounds",
+		M.get_voxel(grid, 0, 8, 8) == 0 and M.get_voxel(grid, 17, 8, 8) == 0,
+		"out-of-bounds reads are air")
 
-	return pass
-end
-
-------------------------------------------------------------------------------
--- Test 2: Fill Box
-------------------------------------------------------------------------------
-
-local function test_fill_box()
-	local grid = M.create_empty_grid()
-
-	-- Fill a 4×4×4 box at center
+	grid = M.create_empty_grid()
 	M.fill_box(grid, 7, 7, 7, 10, 10, 10, 1)
+	check("data_fill_box", sum_solid(grid) == 64, "4x4x4 fill = 64 cells")
 
-	local count = M.count_solid(grid)
-	local expected = 4 * 4 * 4 -- 64 voxels
-	local pass = (count == expected)
-	log_test("fill_box", pass, string.format("Filled 4×4×4 box: %d voxels (expected %d)", count, expected))
-
-	-- Verify corners are solid
-	pass = pass and M.get_voxel(grid, 7, 7, 7) == 1
-	pass = pass and M.get_voxel(grid, 10, 10, 10) == 1
-	-- Verify outside is air
-	pass = pass and M.get_voxel(grid, 6, 6, 6) == 0
-	pass = pass and M.get_voxel(grid, 11, 11, 11) == 0
-
-	return pass
+	grid = M.create_empty_grid()
+	M.fill_box(grid, -4, -4, -4, 20, 20, 20, 1)
+	check("data_fill_clipped", sum_solid(grid) == M.VOXEL_COUNT, "over-extended fill clips")
 end
 
-------------------------------------------------------------------------------
--- Test 3: RLE Compression
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Storage
+-------------------------------------------------------------------------------
 
-local function test_compression()
-	-- Test with all-solid grid (should compress very well)
-	local grid = M.create_filled_grid(1)
-	local ratio, compressed_size = M.get_compression_ratio(grid)
-	local pass = ratio > 100 -- Should be >100x for solid block
-	log_test("compress_solid", pass,
-		string.format("Solid block compression: %.1fx (%d bytes → %d bytes)",
-			ratio, M.VOXEL_COUNT, compressed_size))
-
-	-- Test round-trip: compress then decompress
-	local compressed = M.compress_grid(grid)
-	local decompressed = M.decompress_grid(compressed)
-	local match = true
+local function test_storage()
+	local flat = M.create_filled_grid(1)
+	local decoded = M.decompress_grid(M.compress_grid(flat))
+	local same = true
 	for i = 1, M.VOXEL_COUNT do
-		if grid[i] ~= decompressed[i] then
-			match = false
+		if decoded[i] ~= flat[i] then
+			same = false
 			break
 		end
 	end
-	log_test("compress_roundtrip", match, "Compress/decompress round-trip")
+	check("rle_roundtrip_flat", same, "flat grid round-trips")
 
-	-- Test with checkerboard pattern (worst case for RLE)
-	grid = M.create_empty_grid()
-	for z = 1, M.RESOLUTION do
-		for y = 1, M.RESOLUTION do
-			for x = 1, M.RESOLUTION do
+	local noisy = M.create_empty_grid()
+	for z = 1, R do
+		for y = 1, R do
+			for x = 1, R do
 				if (x + y + z) % 2 == 0 then
-					M.set_voxel(grid, x, y, z, 1)
+					M.set_voxel(noisy, x, y, z, (x % 2) + 1)
 				end
 			end
 		end
 	end
-	ratio, compressed_size = M.get_compression_ratio(grid)
-	log_test("compress_checkerboard", ratio < 2,
-		string.format("Checkerboard compression: %.2fx (%d bytes → %d bytes)",
-			ratio, M.VOXEL_COUNT, compressed_size))
+	decoded = M.decompress_grid(M.compress_grid(noisy))
+	same = true
+	for i = 1, M.VOXEL_COUNT do
+		if decoded[i] ~= noisy[i] then
+			same = false
+			break
+		end
+	end
+	check("rle_roundtrip_noisy", same, "noisy grid round-trips")
 
-	return pass and match
+	local stored = M.compress_grid(noisy)
+	check("rle_size_bound", #stored <= M.VOXEL_COUNT + 1,
+		#stored .. " bytes for a noisy grid (must not exceed 1 byte/cell)")
+
+	local flat_stored = M.compress_grid(flat)
+	check("rle_flat_small", #flat_stored < 32, #flat_stored .. " bytes for a flat grid")
+
+	check("rle_empty_decode", M.is_empty(M.decompress_grid("")), "empty string decodes to air")
 end
 
-------------------------------------------------------------------------------
--- Test 4: Palette Management
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Palette
+-------------------------------------------------------------------------------
 
 local function test_palette()
-	local palette = M.create_palette({"basenodes:stone", "basenodes:dirt"})
+	local palette = M.create_palette({"a:stone", "a:dirt"})
+	check("palette_create", palette[1] == "a:stone" and palette[3] == M.AIR,
+		"palette padded with air")
 
-	local pass = (palette[1] == "basenodes:stone")
-	pass = pass and (palette[2] == "basenodes:dirt")
-	pass = pass and (palette[3] == "air")
-	pass = pass and (palette[4] == "air")
-	log_test("palette_create", pass, "Created palette with 2 materials")
+	check("palette_duplicate", M.palette_add(palette, "a:stone") == 1, "duplicate returns index")
+	check("palette_add", M.palette_add(palette, "a:sand") == 3, "new material takes a free slot")
+	check("palette_full", M.palette_add(palette, "a:gravel") == 4, "last slot")
+	check("palette_overflow", M.palette_add(palette, "a:ice") == nil, "5th material refused")
 
-	-- Add material
-	local idx = M.palette_add(palette, "basenodes:sand")
-	pass = pass and (idx == 3)
-	pass = pass and (palette[3] == "basenodes:sand")
-	log_test("palette_add", pass, "Added third material")
+	local grid = M.create_empty_grid()
+	M.fill_box(grid, 1, 1, 1, 16, 16, 16, 2)
+	local compacted = M.palette_compact(grid, {"a:stone", "a:dirt", "a:sand", "a:gravel"})
+	check("palette_compact",
+		compacted[1] == "a:dirt" and compacted[2] == M.AIR
+			and M.get_voxel(grid, 8, 8, 8) == 1,
+		"unused slots dropped and indices renumbered")
 
-	-- Add duplicate (should return existing index)
-	idx = M.palette_add(palette, "basenodes:stone")
-	pass = pass and (idx == 1)
-	log_test("palette_duplicate", pass, "Duplicate material returns existing index")
-
-	-- Serialize/deserialize
-	local str = M.palette_serialize(palette)
-	local palette2 = M.palette_deserialize(str)
-	pass = pass and (#palette2 >= #palette)
-	log_test("palette_serialize", pass, "Palette serialize/deserialize")
-
-	return pass
+	local round_trip = M.palette_deserialize(M.palette_serialize(compacted))
+	check("palette_serialize", round_trip[1] == "a:dirt" and round_trip[4] == M.AIR,
+		"palette serialize/deserialize")
 end
 
-------------------------------------------------------------------------------
--- Test 5: Rotation and Flip
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Transforms
+-------------------------------------------------------------------------------
 
 local function test_transforms()
-	-- Create a simple pattern: solid only in one corner
 	local grid = M.create_empty_grid()
-	M.set_voxel(grid, 1, 1, 1, 1) -- Bottom-left-front corner
+	M.set_voxel(grid, 1, 1, 1, 2)
 
-	-- Rotate 90° CW: (1,1,1) should go to (1,1,16) [front to right]
 	local rotated = M.rotate_grid(grid, 1)
-	local pass = (M.get_voxel(rotated, 1, 1, 16) == 1)
-	log_test("rotate_90", pass, "Rotate 90° CW moves corner voxel")
+	check("rotate_90", M.get_voxel(rotated, 1, 1, R) == 2, "90 deg CW moves corner voxel")
 
-	-- Rotate 4 times should return to original
-	rotated = M.rotate_grid(grid, 4)
-	pass = pass and (M.get_voxel(rotated, 1, 1, 1) == 1)
-	log_test("rotate_360", pass, "Rotate 4×90° = original")
+	local four = M.rotate_grid(grid, 4)
+	check("rotate_360", M.get_voxel(four, 1, 1, 1) == 2, "4x90 = identity")
 
-	-- Flip horizontally: (1,1,1) should go to (16,1,1)
 	local flipped = M.flip_grid(grid)
-	pass = pass and (M.get_voxel(flipped, 16, 1, 1) == 1)
-	log_test("flip_horizontal", pass, "Flip horizontal moves voxel to opposite side")
-
-	return pass
+	check("flip_once", M.get_voxel(flipped, R, 1, 1) == 2, "flip mirrors x")
+	check("flip_twice", M.get_voxel(M.flip_grid(flipped), 1, 1, 1) == 2, "flip twice = identity")
 end
 
-------------------------------------------------------------------------------
--- Test 6: Nodebox Generation
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Mesher
+-------------------------------------------------------------------------------
 
-local function test_nodebox_generation()
-	local grid = M.create_filled_grid(1)
-	local palette = M.create_palette({"basenodes:stone"})
-
-	local nodeboxes = M.generate_optimized_nodeboxes(grid, palette)
-	local pass = (#nodeboxes == 1) -- Should merge into one box
-	log_test("nodebox_full_merge", pass,
-		string.format("Full block generates %d nodebox(es) (expected 1)", #nodeboxes))
-
-	-- Empty grid should generate no nodeboxes
-	grid = M.create_empty_grid()
-	nodeboxes = M.generate_optimized_nodeboxes(grid, palette)
-	pass = pass and (#nodeboxes == 0)
-	log_test("nodebox_empty", pass, "Empty grid generates 0 nodeboxes")
-
-	-- Half-filled grid
-	grid = M.create_empty_grid()
-	M.fill_box(grid, 1, 1, 1, 16, 8, 16, 1) -- Bottom half
-	nodeboxes = M.generate_optimized_nodeboxes(grid, palette)
-	pass = pass and (#nodeboxes >= 1)
-	log_test("nodebox_half", pass,
-		string.format("Half-filled grid generates %d nodebox(es)", #nodeboxes))
-
-	return pass
+local function open_neighbors()
+	return {px = false, nx = false, py = false, ny = false, pz = false, nz = false}
 end
 
-------------------------------------------------------------------------------
--- Test 7: Block Data Serialization
-------------------------------------------------------------------------------
+local function solid_neighbors()
+	return {px = true, nx = true, py = true, ny = true, pz = true, nz = true}
+end
 
-local function test_block_data_serialization()
-	local palette = M.create_palette({"basenodes:stone", "basenodes:dirt"})
-	local grid = M.create_empty_grid()
-	M.fill_box(grid, 1, 1, 1, 8, 16, 16, 1)  -- Left half stone
-	M.fill_box(grid, 9, 1, 1, 16, 16, 8, 2)  -- Part of right half dirt
+local function test_mesher()
+	local palette = M.create_palette({"a:stone"})
 
-	local block_data = M.create_block_data("basenodes:stone", palette, grid, 1)
-	local serialized = M.serialize_block_data(block_data)
+	local boxes = M.build_surface_boxes(M.create_filled_grid(1), palette, open_neighbors(), R)
+	check("mesh_full_six", #boxes == 6, #boxes .. " faces for a full block (expected 6)")
 
-	-- Deserialize
-	local restored = M.deserialize_block_data(serialized)
-
-	local pass = (restored.base == block_data.base)
-	pass = pass and (restored.rotation == block_data.rotation)
-	pass = pass and (#restored.palette >= #block_data.palette)
-
-	-- Check grid matches
-	local match = true
-	for i = 1, M.VOXEL_COUNT do
-		if restored.grid[i] ~= grid[i] then
-			match = false
-			break
+	local in_bounds = true
+	local depth_ok = true
+	local face_depth = (1 / R) * M.FACE_DEPTH_FRACTION
+	for _, box in ipairs(boxes) do
+		local thin_axes = 0
+		for _, axis in ipairs({"x", "y", "z"}) do
+			local lo = math.min(box[axis .. "0"], box[axis .. "1"])
+			local hi = math.max(box[axis .. "0"], box[axis .. "1"])
+			if lo < -0.5 - 1e-9 or hi > 0.5 + 1e-9 then
+				in_bounds = false
+			end
+			if near(hi - lo, face_depth) then
+				thin_axes = thin_axes + 1
+				-- the outward plane must sit on the node boundary
+				local outward = (box.axis == 1 and axis == "x")
+					or (box.axis == 2 and axis == "y")
+					or (box.axis == 3 and axis == "z")
+				if outward and not (near(lo, -0.5) or near(hi, 0.5)) then
+					depth_ok = false
+				end
+			end
+		end
+		if thin_axes ~= 1 then
+			depth_ok = false
 		end
 	end
-	pass = pass and match
+	check("mesh_bounds", in_bounds, "all faces inside the node")
+	check("mesh_depth", depth_ok, "every face box is one non-degenerate slab on a voxel boundary")
 
-	log_test("block_data_serialize", pass, "Block data serialize/deserialize round-trip")
+	check("mesh_empty", #M.build_surface_boxes(M.create_empty_grid(), palette, open_neighbors(), R) == 0,
+		"empty block emits no faces")
+	check("mesh_cull_solid_neighbors",
+		#M.build_surface_boxes(M.create_filled_grid(1), palette, solid_neighbors(), R) == 0,
+		"solid neighbours cull every face")
 
-	return pass
+	local slab = M.create_empty_grid()
+	M.fill_box(slab, 1, 1, 1, 16, 8, 16, 1)
+	local slab_boxes = M.build_surface_boxes(slab, palette, open_neighbors(), R)
+	local top_plane = -math.huge
+	for _, box in ipairs(slab_boxes) do
+		if box.axis == 2 and box.dir > 0 then
+			top_plane = math.max(top_plane, math.max(box.y0, box.y1))
+		end
+	end
+	check("mesh_half_slab", #slab_boxes == 6 and near(top_plane, 0),
+		#slab_boxes .. " faces, top plane at y=0")
+
+	local cavity = M.create_filled_grid(1)
+	M.set_voxel(cavity, 8, 8, 8, 0)
+	check("mesh_inner_cavity",
+		#M.build_surface_boxes(cavity, palette, open_neighbors(), R) == 12,
+		"a one-voxel cavity adds six inner faces")
+
+	local two_materials = M.create_empty_grid()
+	M.fill_box(two_materials, 1, 1, 1, 8, 16, 16, 1)
+	M.fill_box(two_materials, 9, 1, 1, 16, 16, 16, 2)
+	local mixed = M.build_surface_boxes(two_materials,
+		M.create_palette({"a:stone", "a:dirt"}), open_neighbors(), R)
+	check("mesh_two_materials", #mixed == 10, #mixed .. " faces for a split block")
+
+	-- Neighbour culling is per cell, not per node.
+	local grid = M.create_filled_grid(1)
+	local mask = function(u, v)
+		return u <= 8
+	end
+	local neighbours = open_neighbors()
+	neighbours.py = mask
+	local culled = M.build_surface_boxes(grid, palette, neighbours, R)
+	local top_area = 0
+	for _, box in ipairs(culled) do
+		if box.axis == 2 and box.dir > 0 then
+			top_area = top_area + (math.abs(box.x1 - box.x0) * math.abs(box.z1 - box.z0))
+		end
+	end
+	check("mesh_partial_neighbour", near(top_area, 0.5, 1e-6),
+		"half of the top face is culled by a neighbouring chiseled block")
 end
 
-------------------------------------------------------------------------------
--- Test 8: Performance Benchmarks
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Picking
+-------------------------------------------------------------------------------
+
+local function test_picking()
+	local pos = {x = 0, y = 0, z = 0}
+	local full = M.create_filled_grid(1)
+
+	local hit = M.raycast_grid(full, pos, {x = 0, y = 4, z = 0}, {x = 0, y = -1, z = 0}, R)
+	check("pick_top", hit ~= nil and hit.y == R and hit.ny == 1,
+		hit and ("hit " .. hit.x .. "," .. hit.y .. "," .. hit.z .. " n=" .. hit.ny) or "no hit")
+
+	hit = M.raycast_grid(full, pos, {x = -4, y = 0, z = 0}, {x = 1, y = 0, z = 0}, R)
+	check("pick_side", hit ~= nil and hit.x == 1 and hit.nx == -1,
+		hit and ("hit " .. hit.x .. " n=" .. hit.nx) or "no hit")
+
+	local empty = M.create_empty_grid()
+	check("pick_empty", M.raycast_grid(empty, pos, {x = 0, y = 4, z = 0},
+		{x = 0, y = -1, z = 0}, R) == nil, "no hit in an empty block")
+
+	local slab = M.create_empty_grid()
+	M.fill_box(slab, 1, 1, 1, 16, 8, 16, 1)
+	hit = M.raycast_grid(slab, pos, {x = 0, y = 4, z = 0}, {x = 0, y = -1, z = 0}, R)
+	check("pick_slab", hit ~= nil and hit.y == 8 and hit.ny == 1,
+		hit and ("hit y=" .. hit.y) or "no hit")
+end
+
+-------------------------------------------------------------------------------
+-- Brushes
+-------------------------------------------------------------------------------
+
+local function test_brushes()
+	local hit = {x = 9, y = 16, z = 9, nx = 0, ny = 1, nz = 0}
+
+	local push = M.push_brush(hit, 4)
+	check("brush_push",
+		push ~= nil and push.y0 == 16 and push.y1 == 19
+			and push.x0 == 8 and push.x1 == 11 and push.z0 == 8 and push.z1 == 11,
+		"push adds a 4-thick layer above the hit face")
+
+	local pull = M.pull_brush(hit, 4)
+	check("brush_pull",
+		pull ~= nil and pull.y0 == 12 and pull.y1 == 15
+			and pull.x0 == 8 and pull.x1 == 11,
+		"pull carves a 4-thick layer below the hit face")
+
+	local small = M.push_brush({x = 1, y = 1, z = 1, nx = -1, ny = 0, nz = 0}, 1)
+	check("brush_single", small ~= nil and small.x0 == -1 and small.x1 == -1,
+		"a 1-cell push targets the air cell in front of the face")
+
+	local clamped = M.push_brush(hit, 64)
+	check("brush_clamped", clamped ~= nil and (clamped.y1 - clamped.y0) == R - 1,
+		"grid steps are clamped to the block size")
+end
+
+-------------------------------------------------------------------------------
+-- Editing (integration, far away from spawn)
+-------------------------------------------------------------------------------
+
+local TEST_POS = {x = 97, y = 112, z = 97}
+
+local function test_editing()
+	core.load_area(TEST_POS)
+	local stone = M.fallback_material or M.get_fallback_material()
+	core.set_node(TEST_POS, {name = stone})
+
+	local function cleanup()
+		M.remove_block_entities(TEST_POS)
+		M.forget_block(TEST_POS)
+		core.remove_node(TEST_POS)
+	end
+
+	local block = M.chisel_native(TEST_POS)
+	check("edit_chisel", block ~= nil and M.is_micronode_block(TEST_POS)
+		and M.count_solid(block.grid) == M.VOXEL_COUNT,
+		"chiselled block starts fully solid")
+
+	check("edit_appearance_unchanged",
+		#M.build_surface_boxes(block.grid, block.palette, M.build_neighbors(TEST_POS), R) <= 6,
+		"a freshly chiselled block renders only its exposed faces")
+
+	-- Carve the top half away (pull semantics through the API).
+	M.api_fill_box(TEST_POS, 1, 9, 1, R, R, R, "air")
+	block = M.get_block(TEST_POS)
+	check("edit_pull", M.count_solid(block.grid) == R * R * 8,
+		M.count_solid(block.grid) .. " cells left after carving half")
+	check("edit_collision_threshold", M.collision_variant(block.grid) == M.BLOCK_NODE,
+		"exactly half solid still collides")
+
+	M.api_fill_box(TEST_POS, 1, 8, 1, R, 8, R, "air")
+	block = M.get_block(TEST_POS)
+	check("edit_collision_open", M.collision_variant(block.grid) == M.BLOCK_NODE_OPEN,
+		string.format("%.0f%% solid becomes walk-through", M.fill_ratio(block.grid) * 100))
+
+	M.update_collision_node(TEST_POS, block)
+	check("edit_node_swapped", core.get_node(TEST_POS).name == M.BLOCK_NODE_OPEN,
+		"container node swapped to the open variant")
+
+	local mats = M.palette_add(block.palette, stone)
+	check("edit_palette_reuse", mats == 1, "existing material reused")
+	check("edit_palette_after_compact", #block.palette == M.MAX_MATERIALS,
+		"palette always reports four slots")
+
+	-- Undo restores the pre-carve grid.
+	local before = M.compress_grid(M.get_block(TEST_POS).grid)
+	M.apply_region(TEST_POS, M.ordered_region(0, 0, 0, R - 1, R - 1, R - 1), nil,
+		{create = false, player = "mn_test"})
+	check("edit_apply_region", M.is_empty(M.get_block(TEST_POS).grid), "region carve empties the block")
+	local ok, restored = M.undo("mn_test")
+	check("edit_undo", ok and restored >= 1
+			and M.compress_grid(M.get_block(TEST_POS).grid) == before,
+		"undo restored the previous grid")
+
+	-- Undo of a region that created a new block must remove it again.
+	local above = {x = TEST_POS.x, y = TEST_POS.y + 1, z = TEST_POS.z}
+	core.remove_node(above)
+	M.apply_region(TEST_POS, M.ordered_region(0, R, 0, R - 1, 2 * R - 1, R - 1), stone,
+		{create = true, base_material = stone, player = "mn_test"})
+	check("edit_extrude_new_block", M.is_micronode_block(above),
+		"pushing past the block boundary creates a chiseled block there")
+	M.undo("mn_test")
+	check("edit_undo_new_block", not M.is_micronode_block(above),
+		"undo removes the block it created")
+	M.forget_block(above)
+	core.remove_node(above)
+
+	-- Rotation and flip keep the fill count.
+	local filled = M.count_solid(M.get_block(TEST_POS).grid)
+	M.rotate_block(TEST_POS, 1)
+	local flipped = M.count_solid(M.get_block(TEST_POS).grid)
+	M.flip_block(TEST_POS)
+	check("edit_transform_preserves_cells",
+		filled == flipped and filled == M.count_solid(M.get_block(TEST_POS).grid),
+		"rotate/flip preserve the number of solid cells")
+
+	cleanup()
+end
+
+-------------------------------------------------------------------------------
+-- Rendering (entity transform regression)
+-------------------------------------------------------------------------------
+
+local function test_rendering()
+	core.load_area(TEST_POS)
+	local stone = M.fallback_material or M.get_fallback_material()
+	core.set_node(TEST_POS, {name = stone})
+	M.chisel_native(TEST_POS)
+	M.api_fill_box(TEST_POS, 1, 9, 1, R, R, R, "air")
+	M.api_fill_box(TEST_POS, 1, 1, 1, R - 4, R - 4, R - 4, "air")
+
+	local block = M.get_block(TEST_POS)
+	local boxes = M.build_surface_boxes(block.grid, block.palette,
+		M.build_neighbors(TEST_POS), R)
+
+	M.update_block_mesh(TEST_POS)
+
+	-- Expected spawn origin per box: the box center in world space (cube
+	-- visuals are centered on the entity position).
+	local function key(x, y, z)
+		return string.format("%.3f,%.3f,%.3f", x, y, z)
+	end
+	local expected = {}
+	for _, box in ipairs(boxes) do
+		expected[key(
+			TEST_POS.x + (box.x0 + box.x1) / 2,
+			TEST_POS.y + (box.y0 + box.y1) / 2,
+			TEST_POS.z + (box.z0 + box.z1) / 2)] = true
+	end
+
+	local found, matched, centered = 0, 0, true
+	for _, obj in ipairs(core.get_objects_inside_radius(TEST_POS, 2.0)) do
+		local lua = obj:get_luaentity()
+		if lua and lua.name == M.ENTITY_NAME then
+			found = found + 1
+			local p = obj:get_pos()
+			if p and expected[key(p.x, p.y, p.z)] then
+				matched = matched + 1
+			elseif p then
+				centered = false
+			end
+		end
+	end
+
+	check("render_entity_count", found == #boxes,
+		found .. " entities for " .. #boxes .. " faces")
+	check("render_entity_centered", centered and matched == #boxes,
+		matched .. "/" .. #boxes .. " entities sit at their box center")
+
+	-- Second call must be a no-op (cached shape, live entities).
+	local ok = pcall(M.update_block_mesh, TEST_POS)
+	local second = 0
+	for _, obj in ipairs(core.get_objects_inside_radius(TEST_POS, 2.0)) do
+		local lua = obj:get_luaentity()
+		if lua and lua.name == M.ENTITY_NAME then
+			second = second + 1
+		end
+	end
+	check("render_idempotent", ok and second == found,
+		"re-meshing an unchanged block keeps the same entities")
+
+	-- Fully carved: nothing rendered.
+	M.api_fill_box(TEST_POS, 1, 1, 1, R, R, R, "air")
+	local remaining = 0
+	for _, obj in ipairs(core.get_objects_inside_radius(TEST_POS, 2.0)) do
+		local lua = obj:get_luaentity()
+		if lua and lua.name == M.ENTITY_NAME then
+			remaining = remaining + 1
+		end
+	end
+	check("render_empty", remaining == 0, remaining .. " entities left for an empty block")
+
+	M.remove_block_entities(TEST_POS)
+	M.forget_block(TEST_POS)
+	core.remove_node(TEST_POS)
+end
+
+-------------------------------------------------------------------------------
+-- Performance
+-------------------------------------------------------------------------------
 
 local function test_performance()
-	local results = {}
+	local grid = M.create_filled_grid(1)
+	M.fill_box(grid, 1, 1, 1, R, R / 2, R, 0)
+	M.fill_box(grid, 3, 3, 3, 6, 6, 6, 0)
+	local palette = M.create_palette({"a:stone"})
+	local neighbours = open_neighbors()
 
-	-- Benchmark: Create filled grid
 	local start = core.get_us_time()
-	for i = 1, 100 do
-		M.create_filled_grid(1)
+	local iterations = 20
+	for _ = 1, iterations do
+		M.build_surface_boxes(grid, palette, neighbours, R)
 	end
-	results.create_grid_ms = (core.get_us_time() - start) / 1000 / 100
+	local per_call = (core.get_us_time() - start) / 1000 / iterations
 
-	-- Benchmark: Compress solid grid
-	local grid = M.create_filled_grid(1)
 	start = core.get_us_time()
-	for i = 1, 100 do
+	for _ = 1, iterations do
 		M.compress_grid(grid)
 	end
-	results.compress_solid_ms = (core.get_us_time() - start) / 1000 / 100
+	local compress = (core.get_us_time() - start) / 1000 / iterations
 
-	-- Benchmark: Compress checkerboard (worst case)
-	grid = M.create_empty_grid()
-	for z = 1, M.RESOLUTION do
-		for y = 1, M.RESOLUTION do
-			for x = 1, M.RESOLUTION do
-				if (x + y + z) % 2 == 0 then
-					M.set_voxel(grid, x, y, z, 1)
-				end
+	print(string.format("[micronode_chisel] bench: mesh %.2f ms, compress %.2f ms",
+		per_call, compress))
+	check("perf_mesh", per_call < 20, string.format("surface meshing %.2f ms", per_call))
+	check("perf_compress", compress < 5, string.format("compression %.2f ms", compress))
+end
+
+-------------------------------------------------------------------------------
+-- Runner
+-------------------------------------------------------------------------------
+
+core.after(2.0, function()
+	print("[micronode_chisel] ---- self tests ----")
+
+	-- Each suite runs isolated: a raised error is reported as a failure of that
+	-- suite instead of aborting the remaining suites (an error here earlier
+	-- meant later tests never ran, hiding their results).
+	local suites = {
+		{"data", test_data},
+		{"storage", test_storage},
+		{"palette", test_palette},
+		{"transforms", test_transforms},
+		{"mesher", test_mesher},
+		{"picking", test_picking},
+		{"brushes", test_brushes},
+		{"editing", test_editing},
+		{"rendering", test_rendering},
+		{"performance", test_performance},
+	}
+	for _, suite in ipairs(suites) do
+		local before = #results
+		local ok, err = pcall(suite[2])
+		if not ok then
+			check("suite_" .. suite[1], false, tostring(err))
+		end
+		local failed_here = 0
+		for i = before + 1, #results do
+			if not results[i].ok then
+				failed_here = failed_here + 1
 			end
 		end
-	end
-	start = core.get_us_time()
-	for i = 1, 100 do
-		M.compress_grid(grid)
-	end
-	results.compress_checkerboard_ms = (core.get_us_time() - start) / 1000 / 100
-
-	-- Benchmark: Generate nodeboxes
-	grid = M.create_filled_grid(1)
-	local palette = M.create_palette({"basenodes:stone"})
-	start = core.get_us_time()
-	for i = 1, 100 do
-		M.generate_optimized_nodeboxes(grid, palette)
-	end
-	results.nodebox_gen_ms = (core.get_us_time() - start) / 1000 / 100
-
-	-- Benchmark: Rotate grid
-	start = core.get_us_time()
-	for i = 1, 100 do
-		M.rotate_grid(grid, 1)
-	end
-	results.rotate_ms = (core.get_us_time() - start) / 1000 / 100
-
-	print("[micronode_chisel BENCH] Performance Results:")
-	print(string.format("[micronode_chisel BENCH]   Create grid: %.3f ms", results.create_grid_ms))
-	print(string.format("[micronode_chisel BENCH]   Compress (solid): %.3f ms", results.compress_solid_ms))
-	print(string.format("[micronode_chisel BENCH]   Compress (checkerboard): %.3f ms", results.compress_checkerboard_ms))
-	print(string.format("[micronode_chisel BENCH]   Nodebox generation: %.3f ms", results.nodebox_gen_ms))
-	print(string.format("[micronode_chisel BENCH]   Rotate grid: %.3f ms", results.rotate_ms))
-
-	-- All should be under 1ms for good performance
-	local pass = results.create_grid_ms < 1 and
-	             results.compress_solid_ms < 1 and
-	             results.nodebox_gen_ms < 5 and
-	             results.rotate_ms < 5
-
-	log_test("performance", pass, "All operations under performance targets")
-
-	return pass, results
-end
-
-------------------------------------------------------------------------------
--- Test 9: Storage Size Benchmarks
-------------------------------------------------------------------------------
-
-local function test_storage_sizes()
-	local sizes = {}
-
-	-- Solid block
-	local grid = M.create_filled_grid(1)
-	local compressed = M.compress_grid(grid)
-	sizes.solid_bytes = #compressed
-
-	-- Empty block
-	grid = M.create_empty_grid()
-	compressed = M.compress_grid(grid)
-	sizes.empty_bytes = #compressed
-
-	-- Half-filled
-	grid = M.create_empty_grid()
-	M.fill_box(grid, 1, 1, 1, 16, 8, 16, 1)
-	compressed = M.compress_grid(grid)
-	sizes.half_bytes = #compressed
-
-	-- Checkerboard (worst case)
-	grid = M.create_empty_grid()
-	for z = 1, M.RESOLUTION do
-		for y = 1, M.RESOLUTION do
-			for x = 1, M.RESOLUTION do
-				if (x + y + z) % 2 == 0 then
-					M.set_voxel(grid, x, y, z, 1)
-				end
-			end
-		end
-	end
-	compressed = M.compress_grid(grid)
-	sizes.checkerboard_bytes = #compressed
-
-	print("[micronode_chisel BENCH] Storage Sizes (compressed):")
-	print(string.format("[micronode_chisel BENCH]   Solid block: %d bytes (%.1fx compression)",
-		sizes.solid_bytes, M.VOXEL_COUNT / sizes.solid_bytes))
-	print(string.format("[micronode_chisel BENCH]   Empty block: %d bytes (%.1fx compression)",
-		sizes.empty_bytes, M.VOXEL_COUNT / sizes.empty_bytes))
-	print(string.format("[micronode_chisel BENCH]   Half-filled: %d bytes (%.1fx compression)",
-		sizes.half_bytes, M.VOXEL_COUNT / sizes.half_bytes))
-	print(string.format("[micronode_chisel BENCH]   Checkerboard: %d bytes (%.2fx compression)",
-		sizes.checkerboard_bytes, M.VOXEL_COUNT / sizes.checkerboard_bytes))
-
-	-- Solid should be < 100 bytes, checkerboard can be larger
-	local pass = sizes.solid_bytes < 100 and sizes.empty_bytes < 100
-	log_test("storage_sizes", pass, "Storage sizes within acceptable ranges")
-
-	return pass, sizes
-end
-
-------------------------------------------------------------------------------
--- Test 10: Entity rendering (end-to-end visual path)
-------------------------------------------------------------------------------
-
-local function test_entity_rendering()
-	-- Far from spawn so the test block can never trap/kill a spawning player
-	local pos = vector.new(80, 80, 80)
-	core.load_area(pos)
-
-	-- Place a solid stone node
-	local stone = M.fallback_material or M.get_fallback_material()
-	core.set_node(pos, {name = stone})
-
-	-- Chisel it programmatically
-	if not M.api_chisel(pos, stone) then
-		log_test("entity_render", false, "api_chisel failed")
-		return false
+		print(string.format("[micronode_chisel] %-12s %d checks, %d failed",
+			suite[1], #results - before, failed_here))
 	end
 
-	-- Carve a chunk out to make it partial (triggers entity rendering)
-	local ok = M.api_fill_box(pos, 1, 1, 1, 16, 16, 8, "air")
-	if not ok then
-		log_test("entity_render", false, "api_fill_box failed")
-		return false
-	end
-
-	-- Count render entities around the block
-	local center = vector.add(pos, vector.new(0.5, 0.5, 0.5))
-	local count = 0
-	for _, obj in ipairs(core.get_objects_inside_radius(center, 1.3)) do
-		local lua = obj:get_luaentity()
-		if lua and lua.name == "micronode_chisel:box" then
-			count = count + 1
-		end
-	end
-
-	local pass = count >= 1
-	log_test("entity_render", pass,
-		string.format("Partial block spawned %d render entity/entities (expected >= 1)", count))
-
-	-- Fully carve: entities should be gone (grid empty -> nothing rendered)
-	M.api_fill_box(pos, 1, 1, 1, 16, 16, 16, "air")
-	count = 0
-	for _, obj in ipairs(core.get_objects_inside_radius(center, 1.3)) do
-		local lua = obj:get_luaentity()
-		if lua and lua.name == "micronode_chisel:box" then
-			count = count + 1
-		end
-	end
-
-	pass = pass and (count == 0)
-	log_test("entity_cleanup", pass,
-		string.format("Fully-carved block has %d entities (expected 0)", count))
-
-	-- Clean up: the test placed this node, restore it to air
-	core.set_node(pos, {name = "air"})
-
-	return pass
-end
-
-------------------------------------------------------------------------------
--- Run All Tests
-------------------------------------------------------------------------------
-
-local function run_all_tests()
-	print("[micronode_chisel] ========================================")
-	print("[micronode_chisel] Running automated tests...")
-	print("[micronode_chisel] ========================================")
-
-	test_grid_basic()
-	test_fill_box()
-	test_compression()
-	test_palette()
-	test_transforms()
-	test_nodebox_generation()
-	test_block_data_serialization()
-	test_performance()
-	test_storage_sizes()
-	test_entity_rendering()
-
-	-- Summary
-	print("[micronode_chisel] ========================================")
-	print("[micronode_chisel] Test Summary:")
-	local passed = 0
-	local failed = 0
-	for _, r in ipairs(test_results) do
-		if r.passed then
+	local passed, failed = 0, 0
+	for _, result in ipairs(results) do
+		if result.ok then
 			passed = passed + 1
-			print(string.format("[micronode_chisel]   PASS: %s", r.name))
 		else
 			failed = failed + 1
-			print(string.format("[micronode_chisel]   FAIL: %s - %s", r.name, r.msg))
+			print("[micronode_chisel] FAIL " .. result.name .. ": " .. tostring(result.detail))
 		end
 	end
-	print(string.format("[micronode_chisel] Results: %d passed, %d failed", passed, failed))
-	print("[micronode_chisel] ========================================")
-
-	return failed == 0
-end
-
--- Run tests after server initialization
-core.after(2.0, function()
-	local success = run_all_tests()
-	if success then
-		print("[micronode_chisel] ALL TESTS PASSED — Micronode chisel ready")
-	else
-		print("[micronode_chisel] SOME TESTS FAILED — check logs")
+	print(string.format("[micronode_chisel] %d passed, %d failed", passed, failed))
+	if failed == 0 then
+		print("[micronode_chisel] all self tests passed")
 	end
 end)

@@ -1,378 +1,136 @@
--- Micronode Rendering
--- Generates meshes from 16³ voxel data for rendering
--- Uses Luanti's mesh node drawtype
+-- Texture mapping and mesh rebuild for micronode blocks.
+--
+-- A cube entity maps its whole texture onto each face, so the face texture is
+-- the block-relative crop of the material texture at that face position. Crops
+-- use [combine with negative blit offsets on a copy resized to the block
+-- resolution, so the pattern lines up across neighbouring faces *and*
+-- neighbouring blocks (Sauerbraten-style world-aligned texturing) instead of
+-- stretching one copy per merged rectangle.
+--
+-- [combine blits at (x, y) ONTO the output canvas, so a crop needs negative
+-- offsets; positive offsets land outside the canvas and yield a fully
+-- transparent face (an invisible block).
 
 local M = micronode_chisel
+local R = M.RESOLUTION
 
-------------------------------------------------------------------------------
--- Mesh Generation
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Texture cropping
+-------------------------------------------------------------------------------
 
--- Generate a simple cube mesh for a micronode
--- Returns vertices and faces for a single micronode cube
-local function generate_micronode_mesh(material_name, mx, my, mz, size)
-	size = size or (1 / M.RESOLUTION)
-	local x = (mx - 1) / M.RESOLUTION
-	local y = (my - 1) / M.RESOLUTION
-	local z = (mz - 1) / M.RESOLUTION
+-- u grows to the right of the face texture, v grows downwards, both 0..1.
+function M.crop_texture(tile, u0, v0, u1, v1)
+	local lo_u, hi_u = math.min(u0, u1), math.max(u0, u1)
+	local lo_v, hi_v = math.min(v0, v1), math.max(v0, v1)
 
-	-- Get texture for material
-	local tiles = core.registered_nodes[material_name]
-	local texture = "default_stone.png" -- fallback
-	if tiles and tiles.tiles and tiles.tiles[1] then
-		local tile = tiles.tiles[1]
-		if type(tile) == "string" then
-			texture = tile
-		elseif type(tile) == "table" and tile.name then
-			texture = tile.name
-		end
-	end
+	local x = math.floor(lo_u * R + 0.5)
+	local y = math.floor(lo_v * R + 0.5)
+	local w = math.floor(hi_u * R + 0.5) - x
+	local h = math.floor(hi_v * R + 0.5) - y
+	if w < 1 then w = 1 end
+	if h < 1 then h = 1 end
 
-	-- Simple cube vertices (8 corners)
-	local x0, y0, z0 = x, y, z
-	local x1, y1, z1 = x + size, y + size, z + size
-
-	-- We'll use nodebox-style mesh generation instead
-	-- For now, return a simple representation
-	return {
-		min = {x = x0, y = y0, z = z0},
-		max = {x = x1, y = y1, z = z1},
-		texture = texture,
-	}
+	local base = (tile or "blank.png") .. "^[resize:" .. R .. "x" .. R
+	local escaped = base:gsub("([%^:])", "\\%1")
+	return string.format("[combine:%dx%d:%d,%d=%s", w, h, -x, -y, escaped)
 end
 
--- Generate nodeboxes from micronode grid
--- This creates a list of nodeboxes that represent the solid micronodes
--- Each solid micronode becomes a small nodebox
-function M.generate_nodeboxes(grid, palette)
-	local nodeboxes = {}
-	local micronode_size = 1 / M.RESOLUTION
+-- UV region of the outward face of a box, matching createCubeMesh's per-face
+-- UVs (node face space: -0.5..0.5 -> 0..1, v growing down).
+function M.face_uv(box)
+	local x0, x1 = math.min(box.x0, box.x1), math.max(box.x0, box.x1)
+	local y0, y1 = math.min(box.y0, box.y1), math.max(box.y0, box.y1)
+	local z0, z1 = math.min(box.z0, box.z1), math.max(box.z0, box.z1)
 
-	for z = 1, M.RESOLUTION do
-		for y = 1, M.RESOLUTION do
-			for x = 1, M.RESOLUTION do
-				local mat_idx = M.get_voxel(grid, x, y, z)
-				if mat_idx > 0 then
-					local material = M.palette_get(palette, mat_idx)
-					if material and material ~= "air" then
-						local x0 = (x - 1) * micronode_size - 0.5
-						local y0 = (y - 1) * micronode_size - 0.5
-						local z0 = (z - 1) * micronode_size - 0.5
-						local x1 = x0 + micronode_size
-						local y1 = y0 + micronode_size
-						local z1 = z0 + micronode_size
+	if box.axis == 1 and box.dir > 0 then      -- +X
+		return z0 + 0.5, 0.5 - y1, z1 + 0.5, 0.5 - y0
+	elseif box.axis == 1 then                  -- -X
+		return 0.5 - z1, 0.5 - y1, 0.5 - z0, 0.5 - y0
+	elseif box.axis == 2 and box.dir > 0 then  -- +Y
+		return x0 + 0.5, 0.5 - z1, x1 + 0.5, 0.5 - z0
+	elseif box.axis == 2 then                  -- -Y
+		return x0 + 0.5, 0.5 + z0, x1 + 0.5, 0.5 + z1
+	elseif box.axis == 3 and box.dir > 0 then  -- +Z
+		return 0.5 - x1, 0.5 - y1, 0.5 - x0, 0.5 - y0
+	end
+	return x0 + 0.5, 0.5 - y1, x1 + 0.5, 0.5 - y0 -- -Z
+end
 
-						-- Get texture for this material
-						local texture = M.get_texture(material)
+-- Six-texture array for a face box (only the outward face is ever visible; the
+-- same crop is repeated so the buried faces are textured consistently).
+function M.face_textures(box)
+	local tile = M.get_tile(box.material, M.cube_face(box.axis, box.dir))
+	local u0, v0, u1, v1 = M.face_uv(box)
+	local texture = M.crop_texture(tile, u0, v0, u1, v1)
+	return {texture, texture, texture, texture, texture, texture}
+end
 
-						table.insert(nodeboxes, {
-							type = "fixed",
-							fixed = {{x0, y0, z0, x1, y1, z1}},
-						})
-					end
-				end
+-------------------------------------------------------------------------------
+-- Block mesh rebuild
+-------------------------------------------------------------------------------
+
+-- Rebuild the visible geometry of one block. Cheap no-op when the shape is
+-- unchanged and its entities are still alive.
+function M.update_block_mesh(pos)
+	local block = M.get_block(pos)
+	if not block then
+		M.remove_block_entities(pos)
+		return
+	end
+
+	local neighbors = M.build_neighbors(pos)
+	local budget = M.render_budget()
+	local boxes = M.build_surface_boxes(block.grid, block.palette, neighbors, R)
+
+	if #boxes > budget then
+		-- Emergency path: re-mesh a conservative (any-solid) downsample of the
+		-- shape so the block stays closed and recognizable instead of flooding
+		-- the world with entities or snapping back to a full cube.
+		for _, step in ipairs({2, 4, 8}) do
+			local coarse, res = M.coarsen_grid(block.grid, step, R)
+			local coarse_boxes = M.build_surface_boxes(coarse, block.palette, neighbors, res)
+			if #coarse_boxes <= budget then
+				boxes = coarse_boxes
+				core.log("action", "[micronode_chisel] " .. core.pos_to_string(pos)
+					.. ": rendering " .. #boxes .. " faces at 1/" .. step .. " resolution")
+				break
 			end
 		end
 	end
 
-	return nodeboxes
-end
-
--- Optimized: Merge adjacent micronodes into larger boxes (greedy meshing)
-function M.generate_optimized_nodeboxes(grid, palette)
-	local micronode_size = 1 / M.RESOLUTION
-	local visited = {}
-	local nodeboxes = {}
-
-	local function is_solid(x, y, z)
-		if x < 1 or x > M.RESOLUTION or y < 1 or y > M.RESOLUTION or z < 1 or z > M.RESOLUTION then
-			return false
-		end
-		return M.get_voxel(grid, x, y, z) > 0
+	local hash = M.boxes_hash(boxes)
+	if M.is_current(pos, hash) then
+		return
 	end
 
-	local function is_visited(x, y, z)
-		local idx = (z - 1) * M.RESOLUTION * M.RESOLUTION + (y - 1) * M.RESOLUTION + x
-		return visited[idx] == true
+	M.remove_block_entities(pos)
+	if #boxes == 0 then
+		return
 	end
 
-	local function mark_visited(x, y, z)
-		local idx = (z - 1) * M.RESOLUTION * M.RESOLUTION + (y - 1) * M.RESOLUTION + x
-		visited[idx] = true
-	end
-
-	-- Greedy meshing: find largest boxes
-	for z = 1, M.RESOLUTION do
-		for y = 1, M.RESOLUTION do
-			for x = 1, M.RESOLUTION do
-				if is_solid(x, y, z) and not is_visited(x, y, z) then
-					local mat_idx = M.get_voxel(grid, x, y, z)
-					local material = M.palette_get(palette, mat_idx)
-
-					-- Find最大 extent in X direction
-					local sx = x
-					while sx < M.RESOLUTION and is_solid(sx + 1, y, z) and not is_visited(sx + 1, y, z)
-						and M.get_voxel(grid, sx + 1, y, z) == mat_idx do
-						sx = sx + 1
-					end
-
-					-- Find extent in Y direction
-					local sy = y
-					local can_extend_y = true
-					while sy < M.RESOLUTION and can_extend_y do
-						for ix = x, sx do
-							if not is_solid(ix, sy + 1, z) or is_visited(ix, sy + 1, z)
-								or M.get_voxel(grid, ix, sy + 1, z) ~= mat_idx then
-								can_extend_y = false
-								break
-							end
-						end
-						if can_extend_y then
-							sy = sy + 1
-						end
-					end
-
-					-- Find extent in Z direction
-					local sz = z
-					local can_extend_z = true
-					while sz < M.RESOLUTION and can_extend_z do
-						for iy = y, sy do
-							for ix = x, sx do
-								if not is_solid(ix, iy, sz + 1) or is_visited(ix, iy, sz + 1)
-									or M.get_voxel(grid, ix, iy, sz + 1) ~= mat_idx then
-									can_extend_z = false
-									break
-								end
-							end
-							if not can_extend_z then break end
-						end
-						if can_extend_z then
-							sz = sz + 1
-						end
-					end
-
-					-- Mark all voxels in this box as visited
-					for iz = z, sz do
-						for iy = y, sy do
-							for ix = x, sx do
-								mark_visited(ix, iy, iz)
-							end
-						end
-					end
-
-					-- Create nodebox
-					local x0 = (x - 1) * micronode_size - 0.5
-					local y0 = (y - 1) * micronode_size - 0.5
-					local z0 = (z - 1) * micronode_size - 0.5
-					local x1 = sx * micronode_size - 0.5
-					local y1 = sy * micronode_size - 0.5
-					local z1 = sz * micronode_size - 0.5
-
-					table.insert(nodeboxes, {
-						x0 = x0, y0 = y0, z0 = z0,
-						x1 = x1, y1 = y1, z1 = z1,
-						material = material,
-					})
-				end
-			end
-		end
-	end
-
-	return nodeboxes
-end
-
--- Get texture for a material
-function M.get_texture(material_name)
-	if not material_name or material_name == "air" then
-		return "blank.png"
-	end
-
-	local node = core.registered_nodes[material_name]
-	if not node then
-		return "default_stone.png"
-	end
-
-	if node.tiles and node.tiles[1] then
-		local tile = node.tiles[1]
-		if type(tile) == "string" then
-			return tile
-		elseif type(tile) == "table" then
-			if tile.name then
-				return tile.name
-			elseif tile.image then
-				return tile.image
-			end
-		end
-	end
-
-	return "default_stone.png"
-end
-
--- Generate a mesh string for a micronode block
--- This creates a .obj-like mesh that Luanti can use
--- Note: For mod-only implementation, we use nodeboxes instead of custom meshes
--- because custom mesh nodes require mesh files
-
-function M.get_nodebox_list(grid, palette)
-	-- Use optimized nodeboxes for better performance
-	local boxes = M.generate_optimized_nodeboxes(grid, palette)
-
-	-- Convert to Luanti nodebox format
-	local nodeboxes = {}
+	local objs = {}
 	for _, box in ipairs(boxes) do
-		table.insert(nodeboxes, {
-			box.x0, box.y0, box.z0,
-			box.x1, box.y1, box.z1,
-		})
-	end
-
-	-- If no solid voxels, return empty (invisible)
-	if #nodeboxes == 0 then
-		return {{-0.5, -0.5, -0.5, -0.5, -0.5, -0.5}} -- Degenerate box (invisible)
-	end
-
-	return nodeboxes
-end
-
-------------------------------------------------------------------------------
--- Surface-Only Meshing (Cube 2 / Sauerbraten style)
-------------------------------------------------------------------------------
--- Sauerbraten renders only the *exposed* faces of its octree, merged into
--- large coplanar rectangles. We do the same for the 16^3 micronode grid:
--- a rectangle is emitted only where a solid micronode is adjacent to air,
--- greedily merged per plane and material. No interior geometry, no
--- overlapping solid boxes, no z-fighting.
---
--- solid_outside: {px, nx, py, ny, pz, nz} — whether the neighboring Luanti
--- node on that side is solid. Faces against solid neighbors are never
--- visible and are culled.
---
--- Returns rects: {x0,y0,z0,x1,y1,z1 (nodebox coords, paper-thin on the face
--- plane), material = node name}.
-
-function M.generate_surface_faces(grid, palette, solid_outside, res)
-	local R = res or M.RESOLUTION
-	local rects = {}
-
-	-- Local voxel access indexed with THIS grid's resolution: M.get_voxel
-	-- hardcodes the 16^3 stride and misindexes coarse grids.
-	local function voxel(x, y, z)
-		if x < 1 or x > R or y < 1 or y > R or z < 1 or z > R then
-			return 0
-		end
-		return grid[(z - 1) * R * R + (y - 1) * R + x] or 0
-	end
-
-	local function nb0(c) return (c - 1) / R - 0.5 end
-	local function nb1(c) return c / R - 0.5 end
-
-	-- axis: 1 = x, 2 = y, 3 = z; slice s along the axis, (u, v) in-plane
-	local function voxel_at(axis, s, u, v)
-		if axis == 1 then return s, u, v end
-		if axis == 2 then return u, s, v end
-		return u, v, s
-	end
-
-	local function outside_key(axis, dir)
-		if axis == 1 then return dir > 0 and "px" or "nx" end
-		if axis == 2 then return dir > 0 and "py" or "ny" end
-		return dir > 0 and "pz" or "nz"
-	end
-
-	for axis = 1, 3 do
-		for _, dir in ipairs({-1, 1}) do
-			for s = 1, R do
-				-- exposed[mask] per material, 0 = not exposed
-				local mask, visited = {}, {}
-				for u = 1, R do
-					mask[u], visited[u] = {}, {}
-					for v = 1, R do
-						local x, y, z = voxel_at(axis, s, u, v)
-						local mat = voxel(x, y, z)
-						visited[u][v] = false
-						mask[u][v] = 0
-						if mat > 0 then
-							local nx, ny, nz = x, y, z
-							if axis == 1 then nx = x + dir
-							elseif axis == 2 then ny = y + dir
-							else nz = z + dir end
-							local open
-							if nx >= 1 and nx <= R and ny >= 1 and ny <= R
-								and nz >= 1 and nz <= R then
-								open = voxel(nx, ny, nz) == 0
-							else
-								-- solid_outside[key] is true when the
-								-- neighboring Luanti node is NOT walkable
-								open = solid_outside == nil
-									or solid_outside[outside_key(axis, dir)] == true
-							end
-							local material = M.palette_get(palette, mat)
-							if open and material and material ~= "air" then
-								mask[u][v] = mat
-							end
-						end
-					end
-				end
-
-				-- greedy rectangle merge over the exposed mask
-				for u = 1, R do
-					for v = 1, R do
-						local mat = mask[u][v]
-						if mat > 0 and not visited[u][v] then
-							local v2 = v
-							while v2 < R and mask[u][v2 + 1] == mat
-								and not visited[u][v2 + 1] do
-								v2 = v2 + 1
-							end
-							local u2 = u
-							local can_extend = true
-							while u2 < R and can_extend do
-								for vv = v, v2 do
-									if mask[u2 + 1][vv] ~= mat or visited[u2 + 1][vv] then
-										can_extend = false
-										break
-									end
-								end
-								if can_extend then u2 = u2 + 1 end
-							end
-							for uu = u, u2 do
-								for vv = v, v2 do
-									visited[uu][vv] = true
-								end
-							end
-							-- Box on the face plane extended one voxel deep
-							-- INTO the solid: the face quad gets the full voxel
-							-- depth so adjoining faces/quads overlap inside the
-							-- shape and the block reads as one continuous solid
-							-- (no seams or split-part look). The overlap is
-							-- hidden inside the shape; the outside surface planes
-							-- stay exact.
-							local depth = 1 / R
-							local p0 = dir > 0 and nb1(s) or nb0(s)
-							local p1 = dir > 0 and (p0 - depth) or (p0 + depth)
-							local rect = nil
-							if axis == 1 then
-								rect = {x0 = p0, x1 = p1,
-									y0 = nb0(u), y1 = nb1(u2),
-									z0 = nb0(v), z1 = nb1(v2)}
-							elseif axis == 2 then
-								rect = {y0 = p0, y1 = p1,
-									x0 = nb0(u), x1 = nb1(u2),
-									z0 = nb0(v), z1 = nb1(v2)}
-							else
-								rect = {z0 = p0, z1 = p1,
-									x0 = nb0(u), x1 = nb1(u2),
-									y0 = nb0(v), y1 = nb1(v2)}
-							end
-							rect.material = M.palette_get(palette, mat)
-							table.insert(rects, rect)
-						end
-					end
-				end
-			end
+		local obj = M.spawn_box(pos, box, M.face_textures(box))
+		if obj then
+			objs[#objs + 1] = obj
 		end
 	end
-	return rects
+	M.remember(pos, hash, objs)
 end
 
-print("[micronode_chisel] Rendering loaded")
+print("[micronode_chisel] Renderer loaded")
+
+-------------------------------------------------------------------------------
+-- Rebuild on mapblock activation
+-------------------------------------------------------------------------------
+
+core.register_lbm({
+	name = "micronode_chisel:rebuild_meshes",
+	label = "Rebuild micronode render entities",
+	nodenames = {M.BLOCK_NODE, M.BLOCK_NODE_OPEN},
+	run_at_every_load = true,
+	action = function(pos)
+		M.forget_block(pos)
+		M.update_block_mesh(pos)
+	end,
+})

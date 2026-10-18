@@ -1,368 +1,123 @@
 #!/usr/bin/env python3
-"""Headless semantic QC for the micronode_chisel mod.
+"""Headless QC for the micronode_chisel mod.
 
-Executes the actual mod Lua files with a stubbed Luanti ("core") API via
-lupa, then runs functional checks against the real implementations:
-surface meshing, grid coarsening, voxel DDA picking, serialization, and
-the texture crop string generation.
+Runs the *real* mod Lua files against a stubbed Luanti API (tools/stub.lua) and
+then executes tools/qc_checks.lua, which drives the actual implementations:
 
-Catches what syntax checks cannot: undefined global calls (the class of
-bug that shipped three times), nil indexing, and wrong logic.
+  * grid/palette/storage round trips and size bounds
+  * surface meshing (face count, bounds, one-voxel inward depth, neighbour
+    culling, per-material splits, hash signature)
+  * render-budget coarsening
+  * voxel DDA picking and brush regions
+  * collision variant selection
+  * the full render path: chiselling, carving, entity spawn positions/sizes and
+    texture crops (this is what catches the "disconnected faces" class of bug)
+  * dig/drop wiring
+
+A second pass loads every file with a strict `_G` metatable that raises on
+undefined global reads, which catches orphaned references (the class of bug
+behind several earlier startup crashes).
 """
+import os
 import sys
-import math
+
 import lupa
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MOD_DIR = os.path.join(HERE, "..", "micronode_chisel")
+
+# Load order must match init.lua.
+MOD_FILES = [
+    "data.lua",
+    "collision.lua",
+    "mesh.lua",
+    "edit.lua",
+    "entities.lua",
+    "render.lua",
+    "chisel.lua",
+    "api.lua",
+]
 
 FAILURES = []
 
 
-def fail(msg):
-    FAILURES.append(msg)
-    print(f"FAIL: {msg}")
+def fail(message):
+    FAILURES.append(message)
+    print(f"FAIL: {message}")
 
 
-def ok(msg):
-    print(f"  ok: {msg}")
+def read(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
 
 
-def make_runtime():
-    L = lupa.LuaRuntime(unpack_returned_tuples=True)
-
-    api = {}
-
-    def register_node(name, defn=None):
-        api.setdefault("nodes", {})[name] = defn or {}
-
-    def get_node(pos):
-        return {"name": "air", "param2": 0}
-
-    def get_meta(pos):
-        store = {}
-
-        class Meta:
-            def get_string(self, k):
-                return store.get(k, "")
-
-            def set_string(self, k, v):
-                store[k] = v
-
-        return Meta()
-
-    # Lua-native stubs (Python callables bridge poorly for method-style
-    # calls like meta:get_string). tools/stub.lua is the single source.
-    import os
-    stub_path = os.path.join(os.path.dirname(__file__), "stub.lua")
-    with open(stub_path) as fh:
-        L.execute(fh.read())
-    # dynamic media capture for the entity audit; write_json passes the
-    # table through so the audit can inspect real sizes/textures
-    L.execute(r"""
-    __spawned = {}
-    core.write_json = function(t) return t end
-    core.parse_json = function(s) return s end
-    core.add_entity = function(pos, name, data)
-        table.insert(__spawned, {pos = pos, name = name, raw = data})
-    end
-    """)
-
-    # vector stubs (full API surface used by the mod)
-    vector_code = r'''
-    vector = {}
-    vector.new = function(x, y, z)
-        if type(x) == "table" then return {x = x.x or 0, y = x.y or 0, z = x.z or 0} end
-        return {x = x or 0, y = y or 0, z = z or 0}
-    end
-    vector.add = function(a, b) return {x = a.x + b.x, y = a.y + b.y, z = a.z + b.z} end
-    vector.subtract = function(a, b) return {x = a.x - b.x, y = a.y - b.y, z = a.z - b.z} end
-    vector.multiply = function(a, s) return {x = a.x * s, y = a.y * s, z = a.z * s} end
-    vector.equals = function(a, b) return a.x == b.x and a.y == b.y and a.z == b.z end
-    vector.round = function(a)
-        return {x = math.floor(a.x + 0.5), y = math.floor(a.y + 0.5), z = math.floor(a.z + 0.5)}
-    end
-    '''
-    L.execute(vector_code)
-    return L
+def strict_prelude():
+    return read(os.path.join(HERE, "stub.lua")) + r"""
+setmetatable(_G, {
+    __index = function(_, key)
+        error("undefined global read: " .. tostring(key), 2)
+    end,
+})
+"""
 
 
-def load_mod(L):
-    files = ["data.lua", "render.lua", "collision.lua", "chisel.lua",
-             "api.lua", "entities.lua"]
-    import os
-    base = os.path.join(os.path.dirname(__file__), "..", "micronode_chisel")
-    L.globals()["micronode_chisel"] = L.table()
-    for f in files:
-        path = os.path.join(base, f)
-        with open(path) as fh:
-            src = fh.read()
-        # dofile equivalent executed in the runtime's globals
-        fn = L.eval(f"(function() {src}\nend)")
+def load_mod_file(runtime, name):
+    source = read(os.path.join(MOD_DIR, name))
+    runtime.execute("(function()\n" + source + "\nend)()")
+
+
+def run_functional_checks():
+    runtime = lupa.LuaRuntime(unpack_returned_tuples=True)
+    runtime.execute(read(os.path.join(HERE, "stub.lua")))
+
+    for name in MOD_FILES:
         try:
-            fn()
-        except Exception as e:
-            fail(f"{f} raised during load: {e}")
-            raise
-    return L.globals()["micronode_chisel"]
+            load_mod_file(runtime, name)
+        except Exception as exc:  # noqa: BLE001 - report and abort
+            fail(f"{name} raised while loading: {exc}")
+            return False
+
+    checks = read(os.path.join(HERE, "qc_checks.lua"))
+    try:
+        result = runtime.eval("(function()\n" + checks + "\nend)()")
+    except Exception as exc:  # noqa: BLE001
+        fail(f"qc_checks.lua raised: {exc}")
+        return False
+
+    if result is not None:
+        for index in range(1, len(result) + 1):
+            fail(str(result[index]))
+    return True
 
 
-def check_spawn_origin(L, M):
-    """Verify the render entity is positioned so its visual box covers exactly
-    the intended world region, for both anchor modes."""
-    import lupa
-    # emulate spawn_box origin math for a sample face box
-    pos = {"x": 10, "y": 20, "z": 30}
-    box = {"x0": -0.5, "x1": 0.5, "y0": 0.4375, "y1": 0.5, "z0": -0.5, "z1": 0.5}
-    sx = max(box["x1"] - box["x0"], 1/64)
-    sy = max(box["y1"] - box["y0"], 1/64)
-    sz = max(box["z1"] - box["z0"], 1/64)
-    # corner anchor: origin at min corner; box occupies [origin, origin+size]
-    origin = (pos["x"] + box["x0"] + 0.5, pos["y"] + box["y0"] + 0.5, pos["z"] + box["z0"] + 0.5)
-    occupied = (origin[0], origin[0] + sx, origin[1], origin[1] + sy, origin[2], origin[2] + sz)
-    expected = (10.0, 11.0, 20.9375, 21.0, 30.0, 31.0)
-    for got, want in zip(occupied, expected):
-        if abs(got - want) > 1e-9:
-            fail(f"corner-anchor spawn origin wrong: got {occupied}, want {expected}")
-            return
-    ok("corner-anchor spawn origin places box exactly in intended region")
-
-
-def check_semantics(L, M):
-    R = 16
-
-    def sides(open_all=True):
-        t = L.table()
-        for k in ("px", "nx", "py", "ny", "pz", "nz"):
-            t[k] = open_all
-        return t
-
-    # --- meshing: full block -> exactly 6 faces spanning the node
-    grid = M.create_filled_grid(1)
-    faces = M.generate_surface_faces(grid, L.table("default:stone"), sides())
-    faces = [faces[i] for i in range(1, len(faces) + 1)]
-    if len(faces) != 6:
-        fail(f"full block mesh: expected 6 faces, got {len(faces)}")
-    else:
-        ok("full block meshes to exactly 6 faces")
-        for f in faces:
-            for axis in ("x", "y", "z"):
-                lo, hi = f[axis + "0"], f[axis + "1"]
-                if abs(lo + 0.5) > 1e-9 and abs(hi - 0.5) > 1e-9:
-                    lo_span = abs(lo - hi)
-                    if lo_span > 1e-9 and abs(lo + 0.5) < 1e-9 and abs(hi - 0.5) < 1e-9:
-                        continue
-    # extents
-    for f in faces:
-        for a in ("x", "y", "z"):
-            lo, hi = min(f[a + "0"], f[a + "1"]), max(f[a + "0"], f[a + "1"])
-            if not (-0.5 - 1e-9 <= lo and hi <= 0.5 + 1e-9):
-                fail(f"face out of node bounds on {a}: {lo}..{hi}")
-                break
-    else:
-        ok("all faces within node bounds")
-    # outward planes must sit exactly on the node boundary
-    planes = []
-    for f in faces:
-        for a in ("x", "y", "z"):
-            lo, hi = min(f[a+"0"], f[a+"1"]), max(f[a+"0"], f[a+"1"])
-            if abs(hi - lo) < 1e-9:  # paper-thin axis (should not happen now)
-                pass
-        planes.append(f)
-    outward = []
-    for f in faces:
-        for a in ("x", "y", "z"):
-            lo, hi = min(f[a+"0"], f[a+"1"]), max(f[a+"0"], f[a+"1"])
-            if abs(abs(lo) - 0.5) < 1e-9 or abs(abs(hi) - 0.5) < 1e-9:
-                if abs(hi - lo) <= 1/16 + 1e-9:  # depth axis
-                    outward.append((a, lo, hi))
-    if len(outward) < 6:
-        fail(f"expected >= 6 boundary faces for full block, got {len(outward)}")
-    else:
-        ok("full block has boundary faces on all sides with inward depth")
-
-    # --- empty block -> 0 faces
-    if len(M.generate_surface_faces(M.create_empty_grid(), L.table(), sides())) != 0:
-        fail("empty block should produce 0 faces")
-    else:
-        ok("empty block produces 0 faces")
-
-    # --- half slab: 6 faces, top face at y=+0.25? slab y1..8 -> top plane at 8/16-0.5=0
-    grid = M.create_empty_grid()
-    M.fill_box(grid, 1, 1, 1, 16, 8, 16, 1)
-    faces = M.generate_surface_faces(grid, L.table("default:stone"), sides())
-    faces = [faces[i] for i in range(1, len(faces) + 1)]
-    tops = [f for f in faces
-            if abs(max(f.y0, f.y1)) < 1e-9 and abs(min(f.y0, f.y1) + 1/16) < 1e-9
-            and (max(f.x1, f.x0) - min(f.x1, f.x0)) > 0.9]
-    if len(faces) != 6 or len(tops) != 1:
-        fail(f"half slab mesh: expected 6 faces with one full-area top, got {len(faces)} faces, {len(tops)} tops")
-    else:
-        ok("half slab meshes to 6 faces, merged top plane at y=0")
-
-    # --- corner carve (the regression that shipped): carve 8^3 corner
-    grid = M.create_filled_grid(1)
-    M.fill_box(grid, 1, 1, 1, 8, 8, 8, 0)
-    full_res = M.generate_surface_faces(grid, L.table("default:stone"), sides())
-    full_res = [full_res[i] for i in range(1, len(full_res) + 1)]
-    ok(f"corner-carved block: {len(full_res)} faces at full res")
-
-    # --- coarsening pipeline: coarse grid must render the whole shape
-    coarse, cR = M.coarsen_grid(grid, 2)
-    if cR != 8:
-        fail(f"coarsen(2) resolution: expected 8, got {cR}")
-    cfaces = M.generate_surface_faces(coarse, L.table("default:stone"), sides(), cR)
-    cfaces = [cfaces[i] for i in range(1, len(cfaces) + 1)]
-    if not cfaces:
-        fail("coarse path produced no faces")
-    else:
-        ext = [(f.x0, f.x1, f.y0, f.y1, f.z0, f.z1) for f in cfaces]
-        minx = min(min(e[0], e[1]) for e in ext)
-        maxx = max(max(e[0], e[1]) for e in ext)
-        miny = min(min(e[2], e[3]) for e in ext)
-        maxy = max(max(e[2], e[3]) for e in ext)
-        minz = min(min(e[4], e[5]) for e in ext)
-        maxz = max(max(e[4], e[5]) for e in ext)
-        if not (maxx > 0.4 and maxy > 0.4 and maxz > 0.4):
-            fail(f"coarse mesh does not span node: x {minx}..{maxx}, y {miny}..{maxy}, z {minz}..{maxz}")
-        else:
-            ok(f"coarse path spans full node ({len(cfaces)} faces)")
-
-    # --- coarse of full stays full
-    coarse2, cR2 = M.coarsen_grid(M.create_filled_grid(1), 4)
-    if M.count_solid(coarse2) != cR2 ** 3:
-        fail("coarsen(full,4) should stay fully solid")
-    else:
-        ok("coarsen of full grid stays full")
-
-    # --- serialization round trip
-    grid = M.create_empty_grid()
-    M.fill_box(grid, 3, 3, 3, 6, 6, 6, 1)
-    M.fill_box(grid, 10, 10, 10, 12, 12, 12, 2)
-    bd = M.create_block_data("default:stone", L.table("default:stone", "default:sand"), grid, 1)
-    ser = M.serialize_block_data(bd)
-    deser = M.deserialize_block_data(ser)
-    same = True
-    for i in range(1, 4097):
-        if deser.grid[i] != grid[i]:
-            same = False
-            break
-    if not same:
-        fail("serialization round trip lost data")
-    else:
-        ok("grid serialization round trip preserves data")
-
-    # --- texture crop strings are valid [combine crops (negative offsets)
-    # emulate the entities.lua crop logic result shape
-    tex = "default_sand.png"
-    s = f"[combine:16x8:0,-8={tex}^[resize:16x16"
-    if not s.startswith("[combine:") or "resize" not in s:
-        fail("crop string format unexpected")
-    ok("crop string format sanity")
-
-
-def check_entity_audit(L, M):
-    """End-to-end: chisel a block, carve a hole, update_block_mesh, and audit
-    every spawned entity: position must equal the box min corner (corner
-    anchor), sizes must equal the (normalized) box extents, and every face
-    texture must be a [combine whose blit actually lands in-canvas."""
-    import lupa
-    # stubs already installed by make_runtime (Lua-native, with meta store
-    # and __spawned capture)
-    pos = L.eval("vector.new(10, 20, 30)")
-    assert M.api_chisel(pos, "default:sand")
-    assert M.api_fill_box(pos, 7, 7, 7, 10, 10, 10, "air")
-    M.update_block_mesh(pos)
-    spawned = L.eval("__spawned")
-    n = len(spawned)
-    if n == 0:
-        fail("entity audit: no entities spawned for carved block")
-        return
-    bad = 0
-    for i in range(1, n + 1):
-        e = spawned[i]
-        p, r = e["pos"], e["raw"]
-        sx, sy, sz = r["sx"], r["sy"], r["sz"]
-        # sizes must be positive multiples of 1/16 (up to float tolerance)
-        for name, v in (("sx", sx), ("sy", sy), ("sz", sz)):
-            if v <= 0 or abs(v * 16 - round(v * 16)) > 1e-6:
-                bad += 1
-                fail(f"entity {i}: invalid {name} = {v}")
-        # position must be the node origin + k/16 offsets
-        for name, v in (("x", p["x"]), ("y", p["y"]), ("z", p["z"])):
-            base = {"x": 10, "y": 20, "z": 30}[name]
-            off = v - base
-            if off < -1e-9 or off > 1 + 1e-9 or abs(off * 16 - round(off * 16)) > 1e-6:
-                bad += 1
-                fail(f"entity {i}: position {name}={v} off-grid (off={off})")
-        # every face texture: [combine:WxH:X,Y=... with blit landing in-canvas
-        texs = r["texs"]
-        for j in range(1, 7):
-            t = str(texs[j])
-            if not t.startswith("[combine:"):
-                bad += 1
-                fail(f"entity {i} tex[{j}]: not a combine: {t}")
-                continue
-            try:
-                dims, rest = t[len("[combine:"):].split(":", 1)
-                w, h = map(int, dims.split("x"))
-                xy, _ = rest.split("=", 1)
-                xs, ys = map(int, xy.split(","))
-            except Exception as ex:
-                bad += 1
-                fail(f"entity {i} tex[{j}]: unparseable combine: {t} ({ex})")
-                continue
-            # blit must land at least partially inside the canvas
-            if xs >= w or ys >= h or xs <= -16 or ys <= -16:
-                bad += 1
-                fail(f"entity {i} tex[{j}]: blit outside canvas: {t}")
-    if bad == 0:
-        ok(f"entity audit: {n} entities, all positions on grid, sizes valid, all 6n face textures in-canvas")
-
-
-def check_strict_globals():
-    """Execute each mod file in a fresh runtime with a strict-G metatable
-    that raises on reads of undefined globals, catching nil-call bugs."""
-    import os
-    base = os.path.join(os.path.dirname(__file__), "..", "micronode_chisel")
-
-    strict_prelude = (
-        open(os.path.join(os.path.dirname(__file__), "stub.lua")).read()
-        + r"""
-        setmetatable(_G, {
-            __index = function(t, k)
-                error("undefined global read: " .. tostring(k), 2)
-            end
-        })
-        """
-    )
-    for f in ["data.lua", "render.lua", "collision.lua", "chisel.lua",
-              "api.lua", "entities.lua"]:
-        with open(os.path.join(base, f)) as fh:
-            src = fh.read()
-        L2 = lupa.LuaRuntime(unpack_returned_tuples=True)
+def run_strict_globals():
+    runtime = lupa.LuaRuntime(unpack_returned_tuples=True)
+    runtime.execute(strict_prelude())
+    ok = True
+    for name in MOD_FILES:
         try:
-            L2.execute(strict_prelude)
-            L2.execute("(function()\n" + src + "\nend)()")
-            ok(f + ": loads under strict globals")
-        except Exception as e:
-            fail(f + ": " + str(e).split("\n")[0])
+            load_mod_file(runtime, name)
+            print(f"  ok: {name} loads under strict globals")
+        except Exception as exc:  # noqa: BLE001
+            fail(f"{name} (strict globals): {str(exc).splitlines()[0]}")
+            ok = False
+    return ok
 
 
 def main():
     print("== micronode_chisel headless QC ==")
-    L = make_runtime()
-    M = load_mod(L)
-    if FAILURES:
-        print(f"\n{len(FAILURES)} failure(s) during load")
-        sys.exit(1)
-    check_semantics(L, M)
-    check_spawn_origin(L, M)
-    check_entity_audit(L, M)
-    check_strict_globals()
+    print("[qc] functional checks")
+    functional = run_functional_checks()
+    print("[qc] strict globals")
+    strict = run_strict_globals()
+
     print()
-    if FAILURES:
+    if FAILURES or not functional or not strict:
         print(f"QC FAILED: {len(FAILURES)} failure(s)")
-        sys.exit(1)
+        return 1
     print("QC PASSED")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

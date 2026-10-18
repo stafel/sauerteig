@@ -1,591 +1,379 @@
--- Chisel Tool Implementation
--- Converts regular nodes to micronode blocks and allows editing
+-- Chisel tool, container nodes and commands.
+--
+-- Player verbs (Cube 2 flavoured: left = push, right = pull):
+--   left click on a plain cube   -> convert it to a chiseled block
+--   left click on a chiseled block -> push: add a grid-thick layer on the face
+--   right click on a chiseled block -> pull: carve a grid-thick layer inwards
+--   sneak + left                 -> cycle grid step (1 2 4 8 16 micronodes)
+--   sneak + right                -> pick the material of the targeted node, or
+--                                   cycle the palette of a chiseled block
+--   aux1 + left / aux1 + right   -> rotate 90 deg / flip the block
 
 local M = micronode_chisel
 
--- Per-player state
-local player_state = {}
+local state = {}
 
 local function get_state(name)
-	local st = player_state[name]
+	local st = state[name]
 	if not st then
-		st = {
-			chisel_mode = false,     -- Is player in chisel editing mode?
-			target_pos = nil,        -- Position of block being chiseled
-			grid_size_idx = 3,       -- Index into M.GRID_SIZES (4 = default)
-			material_idx = 1,        -- Active material index (1-4)
-			palette = nil,           -- Current palette for editing
-			undo_stack = {},         -- Undo history
-			undo_idx = 0,
-		}
-		player_state[name] = st
+		st = {grid_idx = 1, material = nil, palette_idx = 0}
+		state[name] = st
 	end
 	return st
 end
 
-local function get_grid_size(st)
-	return M.GRID_SIZES[st.grid_size_idx]
+local function grid_size(st)
+	return M.GRID_SIZES[st.grid_idx] or 1
 end
 
--- Check if a node can be chiseled (is solid)
-local function is_chiselable(pos)
-	local node = core.get_node(pos)
-	local def = core.registered_nodes[node.name]
-	if not def then return false end
-	if node.name == "air" or node.name == "ignore" then return false end
-	-- Check if it's a solid, full cube node
-	local drawtype = def.drawtype or "normal"
-	if drawtype == "normal" or drawtype == "allfaces" or drawtype == "allfaces_optional" then
+local function tell(name, text)
+	core.chat_send_player(name, "[chisel] " .. text)
+end
+
+-- The tool is the instrument, the `chisel` privilege is the permission.
+local function can_edit(name)
+	if not core.check_player_privs then
 		return true
 	end
-	return false
-end
-M.is_chiselable = is_chiselable
-
--- Check if a node is a micronode block
-function M.is_micronode_block(pos)
-	local meta = core.get_meta(pos)
-	return meta:get_string(M.META_KEY_DATA) ~= ""
+	return core.check_player_privs(name, {chisel = true}) == true
 end
 
--- Convert a regular node to a micronode block
-function M.chisel_block(pos, player_name)
-	local node = core.get_node(pos)
-	local def = core.registered_nodes[node.name]
+-------------------------------------------------------------------------------
+-- Container nodes
+-------------------------------------------------------------------------------
+-- The container is invisible (airlike) and holds the grid in metadata. Two
+-- variants exist because a node can only carry one collision behaviour:
+--  * chiseled_block       solid cells >= COLLISION_SOLID_RATIO -> collidable
+--  * chiseled_block_open  mostly carved -> walk-through (a doorway you carved
+--                         is actually usable). Per-cell collision for nodes is
+--                         not expressible in the Luanti node API.
 
-	if not def then
-		core.chat_send_player(player_name, "Cannot chisel unknown node")
-		return false
+local function drop_base(pos)
+	local block = M.get_block(pos)
+	local base = block and block.base
+	if base and not M.is_air_name(base) and core.registered_items[base] then
+		return base
 	end
-
-	if node.name == "air" or node.name == "ignore" then
-		core.chat_send_player(player_name, "Cannot chisel air")
-		return false
-	end
-
-	-- Create initial grid: all solid with base material
-	local palette = M.create_palette({node.name})
-	local grid = M.create_filled_grid(1)  -- All material index 1
-
-	-- Store in node metadata
-	local meta = core.get_meta(pos)
-	local block_data = M.create_block_data(node.name, palette, grid, 0)
-	local serialized = M.serialize_block_data(block_data)
-
-	meta:set_string(M.META_KEY_DATA, serialized.data)
-	meta:set_string(M.META_KEY_PALETTE, serialized.palette)
-	meta:set_string(M.META_KEY_ROTATION, serialized.rotation)
-	meta:set_string(M.META_KEY_BASE, serialized.base)
-
-	-- Change node to micronode container node
-	core.swap_node(pos, {name = "micronode_chisel:chiseled_block", param2 = 0})
-
-	-- Update mesh
-	M.update_block_mesh(pos)
-
-	core.chat_send_player(player_name, "Block chiseled! 16³ micronodes created.")
-	return true
+	return M.fallback_material_or_default()
 end
 
--- update_block_mesh is implemented in entities.lua (entity-based rendering),
--- which is loaded after this file and overrides any earlier definition.
-
--- Edit micronodes: add or remove voxels
-function M.edit_micronodes(pos, mx, my, mz, grid_size, material_idx, add)
-	local meta = core.get_meta(pos)
-	local data_str = meta:get_string(M.META_KEY_DATA)
-	if data_str == "" then return false end
-
-	local block_data = M.deserialize_block_data({
-		data = data_str,
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	-- Save undo state
-	M.save_undo(pos, block_data)
-
-	-- Edit the grid
-	local gs = grid_size or 1
-	local x1 = math.max(1, mx - math.floor((gs - 1) / 2))
-	local y1 = math.max(1, my - math.floor((gs - 1) / 2))
-	local z1 = math.max(1, mz - math.floor((gs - 1) / 2))
-	local x2 = math.min(M.RESOLUTION, x1 + gs - 1)
-	local y2 = math.min(M.RESOLUTION, y1 + gs - 1)
-	local z2 = math.min(M.RESOLUTION, z1 + gs - 1)
-
-	if add then
-		M.fill_box(block_data.grid, x1, y1, z1, x2, y2, z2, material_idx)
-	else
-		M.fill_box(block_data.grid, x1, y1, z1, x2, y2, z2, 0) -- 0 = air
-	end
-
-	-- Save back to metadata
-	local serialized = M.serialize_block_data(block_data)
-	meta:set_string(M.META_KEY_DATA, serialized.data)
-	meta:set_string(M.META_KEY_PALETTE, serialized.palette)
-	meta:set_string(M.META_KEY_ROTATION, serialized.rotation)
-	meta:set_string(M.META_KEY_BASE, serialized.base)
-
-	-- Update mesh
-	M.update_block_mesh(pos)
-
-	return true
-end
-
--- Save undo state
-function M.save_undo(pos, block_data)
-	local meta = core.get_meta(pos)
-	local serialized = M.serialize_block_data(block_data)
-
-	-- Store in a separate metadata key (simplified: just store last state)
-	meta:set_string("mn_undo", serialized.data)
-	meta:set_string("mn_undo_palette", serialized.palette)
-end
-
--- Undo last edit
-function M.undo(pos)
-	local meta = core.get_meta(pos)
-	local undo_data = meta:get_string("mn_undo")
-	if undo_data == "" then return false end
-
-	-- Swap current with undo
-	local current_data = meta:get_string(M.META_KEY_DATA)
-	local current_palette = meta:get_string(M.META_KEY_PALETTE)
-
-	meta:set_string(M.META_KEY_DATA, undo_data)
-	meta:set_string(M.META_KEY_PALETTE, meta:get_string("mn_undo_palette"))
-
-	meta:set_string("mn_undo", current_data)
-	meta:set_string("mn_undo_palette", current_palette)
-
-	M.update_block_mesh(pos)
-	return true
-end
-
--- Rotate the micronode grid
-function M.rotate_block(pos, direction)
-	local meta = core.get_meta(pos)
-	local data_str = meta:get_string(M.META_KEY_DATA)
-	if data_str == "" then return false end
-
-	local block_data = M.deserialize_block_data({
-		data = data_str,
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	block_data.rotation = (block_data.rotation + (direction or 1)) % 4
-	block_data.grid = M.rotate_grid(block_data.grid, direction or 1)
-
-	local serialized = M.serialize_block_data(block_data)
-	meta:set_string(M.META_KEY_DATA, serialized.data)
-	meta:set_string(M.META_KEY_ROTATION, serialized.rotation)
-
-	M.update_block_mesh(pos)
-	return true
-end
-
--- Get block info for display
-function M.get_block_info(pos)
-	local meta = core.get_meta(pos)
-	local data_str = meta:get_string(M.META_KEY_DATA)
-	if data_str == "" then return nil end
-
-	local block_data = M.deserialize_block_data({
-		data = data_str,
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	local solid_count = M.count_solid(block_data.grid)
-	local ratio = M.get_compression_ratio(block_data.grid)
-
+local function container_def(description, walkable)
 	return {
-		base = block_data.base,
-		palette = block_data.palette,
-		rotation = block_data.rotation,
-		solid_count = solid_count,
-		total_voxels = M.VOXEL_COUNT,
-		fill_percent = (solid_count / M.VOXEL_COUNT) * 100,
-		compression_ratio = ratio,
-	}
-end
+		description = description,
+		drawtype = "airlike",
+		paramtype = "light",
+		sunlight_propagates = false,
+		is_ground_content = false,
+		walkable = walkable,
+		pointable = true,
+		tiles = {"micronode_chisel_placeholder.png"},
+		groups = {cracky = 2, oddly_breakable_by_hand = 1,
+			micronode_block = 1, not_in_creative_inventory = 1},
+		selection_box = {type = "regular"},
+		-- Collision only applies to walkable nodes, so the open variant simply
+		-- has no collision box of its own (see collision.lua).
+		collision_box = walkable and {type = "regular"} or nil,
 
-------------------------------------------------------------------------------
--- Load the current voxel grid of a chiseled block
-local function block_grid(pos)
-	local meta = core.get_meta(pos)
-	local data_str = meta:get_string(M.META_KEY_DATA)
-	if data_str == "" then return nil end
-	local block_data = M.deserialize_block_data({
-		data = data_str,
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-	return block_data.grid
-end
-
--- Voxel DDA picking through the block's 16^3 micronode grid (Cube 2 style:
--- the edit lands on the exact micronode surface under the cursor, not on the
--- node boundary box).
--- Returns: mx, my, mz (solid micronode hit), fx, fy, fz (unit face normal
--- pointing to the air side the ray came from)
-local function pick_micronode(pos, player, grid)
-	if not grid then return nil end
-	local eye = vector.add(player:get_pos(), vector.new(0, 1.475, 0))
-	local dir = player:get_look_dir()
-	local R = M.RESOLUTION
-
-	-- block-relative position in voxel units, 1-based voxel indices:
-	-- voxel i covers [(i-1)/R, i/R)
-	local o = {
-		x = (eye.x - pos.x) * R,
-		y = (eye.y - pos.y) * R,
-		z = (eye.z - pos.z) * R,
-	}
-	local d = {x = dir.x * R, y = dir.y * R, z = dir.z * R}
-
-	local c = {x = math.floor(o.x) + 1, y = math.floor(o.y) + 1, z = math.floor(o.z) + 1}
-	local step = {
-		x = d.x > 0 and 1 or -1,
-		y = d.y > 0 and 1 or -1,
-		z = d.z > 0 and 1 or -1,
-	}
-	local delta = {
-		x = d.x ~= 0 and math.abs(1 / d.x) or math.huge,
-		y = d.y ~= 0 and math.abs(1 / d.y) or math.huge,
-		z = d.z ~= 0 and math.abs(1 / d.z) or math.huge,
-	}
-	local function t_max(axis)
-		if d[axis] == 0 then return math.huge end
-		local boundary = step[axis] > 0 and c[axis] or c[axis] - 1
-		return (boundary - o[axis]) / d[axis]
-	end
-	local t = {x = t_max("x"), y = t_max("y"), z = t_max("z")}
-
-	local face = {x = 0, y = 0, z = 0}
-	for _ = 1, 512 do
-		if c.x >= 1 and c.x <= R and c.y >= 1 and c.y <= R
-			and c.z >= 1 and c.z <= R then
-			if M.get_voxel(grid, c.x, c.y, c.z) > 0 then
-				return c.x, c.y, c.z, face.x, face.y, face.z
+		on_construct = function(pos)
+			local meta = core.get_meta(pos)
+			if meta:get_string(M.META_KEY_DATA) == "" then
+				M.set_block(pos, M.create_block_data(M.fallback_material_or_default(),
+					M.create_palette(nil), M.create_empty_grid()))
 			end
-		end
-		local axis
-		if t.x <= t.y and t.x <= t.z then
-			axis = "x"
-		elseif t.y <= t.z then
-			axis = "y"
-		else
-			axis = "z"
-		end
-		if t[axis] == math.huge or t[axis] > 512 then return nil end
-		t[axis] = t[axis] + delta[axis]
-		c[axis] = c[axis] + step[axis]
-		face = {x = 0, y = 0, z = 0}
-		face[axis] = -step[axis]
-	end
-	return nil
+		end,
+
+		on_destruct = function(pos)
+			M.remove_block_entities(pos)
+			M.forget_block(pos)
+		end,
+
+		-- Drop the base material instead of the invisible container node.
+		drop = "",
+
+		on_dig = function(pos, node, digger)
+			local base = drop_base(pos)
+			M.remove_block_entities(pos)
+			M.forget_block(pos)
+			core.remove_node(pos)
+			if digger and digger:is_player() then
+				local stack = ItemStack(base)
+				local inv = digger:get_inventory()
+				if inv and inv:room_for_item("main", stack) then
+					inv:add_item("main", stack)
+				else
+					core.add_item(pos, stack)
+				end
+			end
+			return true
+		end,
+	}
 end
 
--- Chisel Tool Registration
-------------------------------------------------------------------------------
+core.register_node(M.BLOCK_NODE, container_def("Chiseled Block", true))
+core.register_node(M.BLOCK_NODE_OPEN, container_def("Chiseled Block (open)", false))
+
+-------------------------------------------------------------------------------
+-- Tool
+-------------------------------------------------------------------------------
 
 core.register_tool("micronode_chisel:chisel", {
 	description = "Micronode Chisel\n" ..
-		"Left click: Chisel block / Add micronodes\n" ..
-		"Right click: Enter chisel mode / Remove micronodes\n" ..
-		"Sneak + Left: Cycle grid size\n" ..
-		"Sneak + Right: Cycle material\n" ..
-		"Aux1 (E) + Left: Rotate block",
+		"Left: chisel block / push material\n" ..
+		"Right: pull (carve) material\n" ..
+		"Sneak+Left: grid step\n" ..
+		"Sneak+Right: pick or cycle material\n" ..
+		"Aux1+Left: rotate, Aux1+Right: flip",
 	inventory_image = "micronode_chisel_chisel.png",
 	groups = {chisel = 1, not_in_creative_inventory = 1},
 
 	on_use = function(itemstack, user, pointed_thing)
+		if not user or not user:is_player() then
+			return
+		end
 		local name = user:get_player_name()
 		local st = get_state(name)
-		local ctrl = user:get_player_control()
-
-		if pointed_thing.type ~= "node" then
+		if not pointed_thing or pointed_thing.type ~= "node" then
 			return
 		end
-
 		local pos = pointed_thing.under
-		local node = core.get_node(pos)
+		local ctrl = user:get_player_control() or {}
 
-		-- Sneak + Left: Cycle grid size
+		if not can_edit(name) then
+			tell(name, "You need the 'chisel' privilege to edit blocks")
+			return
+		end
+
 		if ctrl.sneak then
-			st.grid_size_idx = (st.grid_size_idx % #M.GRID_SIZES) + 1
-			local gs = get_grid_size(st)
-			core.chat_send_player(name, "Grid size: " .. M.GRID_NAMES[st.grid_size_idx] ..
-				" (" .. gs .. " micronodes)")
+			st.grid_idx = (st.grid_idx % #M.GRID_SIZES) + 1
+			tell(name, "Grid step: " .. M.GRID_NAMES[st.grid_idx]
+				.. " (" .. grid_size(st) .. " micronodes)")
 			return
 		end
 
-		-- Rotate (Aux1/E + Left)
 		if ctrl.aux1 then
-			if M.is_micronode_block(pos) then
-				M.rotate_block(pos, 1)
-				core.chat_send_player(name, "Block rotated 90°")
-			end
-			return
-		end
-
-		-- If not a micronode block, chisel it
-		if not M.is_micronode_block(pos) then
-			if is_chiselable(pos) then
-				M.chisel_block(pos, name)
-				st.chisel_mode = true
-				st.target_pos = pos
-				st.palette = M.create_palette({node.name})
+			if M.rotate_block(pos, 1) then
+				tell(name, "Block rotated 90 degrees")
 			else
-				core.chat_send_player(name, "Cannot chisel this block")
+				tell(name, "Nothing to rotate here")
 			end
 			return
 		end
 
-		-- Micronode block: activate edit mode on first click, then add voxels
-		if not (st.chisel_mode and st.target_pos and vector.equals(st.target_pos, pos)) then
-			st.chisel_mode = true
-			st.target_pos = pos
-			core.chat_send_player(name, "Editing block at " .. core.pos_to_string(pos)
-				.. " — left: add, right: remove, sneak+left: grid size")
+		if not M.is_micronode_block(pos) then
+			if not M.is_chiselable(pos) then
+				tell(name, "This node cannot be chiseled")
+				return
+			end
+			local block = M.chisel_native(pos)
+			if not block then
+				tell(name, "This node cannot be chiseled")
+				return
+			end
+			st.material = block.base
+			M.refresh_block(pos)
+			tell(name, "Chiseled " .. block.base
+				.. " - left adds, right carves, sneak+left changes the grid step")
 			return
 		end
-		do -- add voxels
-			local mx, my, mz, fx, fy, fz = pick_micronode(pos, user, block_grid(pos))
-			if not mx then return end
-			-- Add on the air side of the hit face (Cube 2: edit grows from surface)
-			M.edit_micronodes(pos, mx + fx, my + fy, mz + fz,
-				get_grid_size(st), st.material_idx, true)
-			local info = M.get_block_info(pos)
-			core.chat_send_player(name, string.format(
-				"Added %s micronodes (fill: %.1f%%)",
-				M.palette_get(st.palette or {}, st.material_idx),
-				info and info.fill_percent or 0))
+
+		local ok, info = M.edit_at(user, pos, "push", grid_size(st), st.material)
+		if ok then
+			tell(name, "Pushed (" .. info .. " block touched)")
+		else
+			tell(name, tostring(info))
 		end
 	end,
 
 	on_place = function(itemstack, user, pointed_thing)
+		if not user or not user:is_player() then
+			return itemstack
+		end
 		local name = user:get_player_name()
 		local st = get_state(name)
-		local ctrl = user:get_player_control()
-
-		if pointed_thing.type ~= "node" then
-			return
+		if not pointed_thing or pointed_thing.type ~= "node" then
+			return itemstack
 		end
-
 		local pos = pointed_thing.under
+		local ctrl = user:get_player_control() or {}
 
-		-- Sneak + Right: Cycle material
+		if not can_edit(name) then
+			tell(name, "You need the 'chisel' privilege to edit blocks")
+			return itemstack
+		end
+
 		if ctrl.sneak then
-			st.material_idx = (st.material_idx % M.MAX_MATERIALS) + 1
-			core.chat_send_player(name, "Material slot: " .. st.material_idx)
-			return
-		end
-
-		-- Remove voxels from micronode block (activate mode on first click)
-		if M.is_micronode_block(pos) then
-			if not (st.chisel_mode and st.target_pos and vector.equals(st.target_pos, pos)) then
-				st.chisel_mode = true
-				st.target_pos = pos
-				core.chat_send_player(name, "Editing block at " .. core.pos_to_string(pos)
-					.. " — left: add, right: remove, sneak+left: grid size")
-				return
-			end
-		else
-			return
-		end
-		local mx, my, mz = pick_micronode(pos, user, block_grid(pos))
-		if not mx then return end
-
-			M.edit_micronodes(pos, mx, my, mz, get_grid_size(st), 0, false)
-			local info = M.get_block_info(pos)
-			core.chat_send_player(name, string.format(
-				"Removed micronodes (fill: %.1f%%)",
-				info and info.fill_percent or 0))
-	end,
-
-	on_secondary_use = function(itemstack, user, pointed_thing)
-		local name = user:get_player_name()
-		local st = get_state(name)
-
-		-- Toggle chisel mode info
-		if pointed_thing.type == "node" then
-			local pos = pointed_thing.under
 			if M.is_micronode_block(pos) then
-				local info = M.get_block_info(pos)
-				if info then
-					core.chat_send_player(name, string.format(
-						"Chiseled Block Info:\n" ..
-						"  Base: %s\n" ..
-						"  Fill: %d/%d (%.1f%%)\n" ..
-						"  Rotation: %d°\n" ..
-						"  Palette: %s\n" ..
-						"  Compression: %.1fx",
-						info.base,
-						info.solid_count, info.total_voxels, info.fill_percent,
-						info.rotation * 90,
-						table.concat(info.palette, ", "),
-						info.compression_ratio))
+				local block = M.get_block(pos)
+				if block then
+					-- Cycle through the block's live palette slots.
+					for _ = 1, M.MAX_MATERIALS do
+						st.palette_idx = (st.palette_idx % M.MAX_MATERIALS) + 1
+						local candidate = M.palette_get(block.palette, st.palette_idx)
+						if not M.is_air_name(candidate) then
+							st.material = candidate
+							break
+						end
+					end
+					tell(name, "Material: " .. tostring(st.material))
+				end
+			else
+				local picked = core.get_node(pos).name
+				if not M.is_air_name(picked) then
+					st.material = picked
+					tell(name, "Material: " .. picked)
 				end
 			end
+			return itemstack
 		end
+
+		if ctrl.aux1 then
+			if M.flip_block(pos) then
+				tell(name, "Block flipped")
+			else
+				tell(name, "Nothing to flip here")
+			end
+			return itemstack
+		end
+
+		if M.is_micronode_block(pos) then
+			local ok, info = M.edit_at(user, pos, "pull", grid_size(st), nil)
+			if ok then
+				tell(name, "Carved (" .. info .. " block touched)")
+			else
+				tell(name, tostring(info))
+			end
+		end
+		return itemstack
 	end,
 })
 
-------------------------------------------------------------------------------
--- Chiseled Block Node Definition
-------------------------------------------------------------------------------
-
-core.register_node("micronode_chisel:chiseled_block", {
-	description = "Chiseled Block (Micronode)",
-	tiles = {"micronode_chisel_placeholder.png"},
-	drawtype = "nodebox",
-	paramtype = "light",
-	paramtype2 = "facedir",
-	is_ground_content = true,
-	groups = {cracky = 3, chiseled = 1, not_in_creative_inventory = 1},
-	sounds = {},
-
-	-- The container node itself is invisible: geometry is rendered by
-	-- static entities (see entities.lua). It stays pointable via the
-	-- selection box and solid via the collision box (v1 simplified AABB).
-	node_box = {
-		type = "fixed",
-		fixed = {},
-	},
-
-	selection_box = {
-		type = "regular",
-	},
-
-	collision_box = {
-		type = "regular",
-	},
-
-	-- When placed, initialize as empty chiseled block
-	after_place_node = function(pos, placer, itemstack, pointed_thing)
-		-- Initialize with empty grid if no metadata
-		local meta = core.get_meta(pos)
-		if meta:get_string(M.META_KEY_DATA) == "" then
-			local palette = M.create_palette({"air"})
-			local grid = M.create_empty_grid()
-			local block_data = M.create_block_data("air", palette, grid, 0)
-			local serialized = M.serialize_block_data(block_data)
-			meta:set_string(M.META_KEY_DATA, serialized.data)
-			meta:set_string(M.META_KEY_PALETTE, serialized.palette)
-			meta:set_string(M.META_KEY_ROTATION, serialized.rotation)
-			meta:set_string(M.META_KEY_BASE, serialized.base)
-		end
-	end,
-
-	-- Preserve metadata when dug
-	preserve_metadata = function(pos, oldnode, oldmeta, drops)
-		-- Metadata is preserved automatically by Luanti
-	end,
-
-	-- Drop as item with metadata
-	on_destruct = function(pos)
-		M.remove_block_entities(pos)
-	end,
-
-	-- Digging drops the base material
-	drop = function(pos)
-		local meta = core.get_meta(pos)
-		local base = meta:get_string(M.META_KEY_BASE)
-		if base ~= "" and core.registered_items[base] then
-			return base
-		end
-		return M.get_fallback_material()
-	end,
-})
-
-------------------------------------------------------------------------------
--- Chat Commands
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Commands
+-------------------------------------------------------------------------------
 
 core.register_chatcommand("chisel", {
 	params = "",
 	description = "Get the micronode chisel",
-	func = function(name, param)
+	func = function(name)
 		local player = core.get_player_by_name(name)
 		if not player then
 			return false, "Player not found"
 		end
 		local inv = player:get_inventory()
-		inv:add_item("main", "micronode_chisel:chisel")
+		if inv then
+			inv:add_item("main", "micronode_chisel:chisel")
+		end
 		return true, "Chisel added to inventory"
+	end,
+})
+
+core.register_chatcommand("mn_grid", {
+	params = "[step]",
+	description = "Show or set the chisel grid step (1, 2, 4, 8 or 16 micronodes)",
+	func = function(name, param)
+		local st = get_state(name)
+		local step = tonumber(param)
+		if step then
+			for idx, size in ipairs(M.GRID_SIZES) do
+				if size == step then
+					st.grid_idx = idx
+					break
+				end
+			end
+		end
+		return true, "Grid step: " .. M.GRID_NAMES[st.grid_idx]
+			.. " (" .. grid_size(st) .. " micronodes)"
+	end,
+})
+
+core.register_chatcommand("mn_material", {
+	params = "[node]",
+	description = "Show or set the material used when pushing",
+	func = function(name, param)
+		local st = get_state(name)
+		if param and param ~= "" then
+			if not core.registered_nodes[param] then
+				return false, "Unknown node: " .. param
+			end
+			st.material = param
+		end
+		return true, "Material: " .. tostring(st.material or "(surface material)")
 	end,
 })
 
 core.register_chatcommand("mn_info", {
 	params = "",
-	description = "Show info about targeted chiseled block",
-	func = function(name, param)
+	description = "Show info about the chiseled block you are pointing at",
+	func = function(name)
 		local player = core.get_player_by_name(name)
 		if not player then
 			return false, "Player not found"
 		end
-		local pointed = player:get_pointed_thing()
-		-- Simplified: show info about block at player position - 1
-		local pos = vector.subtract(player:get_pos(), vector.new(0, 1, 0))
-		pos = vector.round(pos)
-
-		if M.is_micronode_block(pos) then
-			local info = M.get_block_info(pos)
-			if info then
-				return true, string.format(
-					"Fill: %.1f%%, Rotation: %d°, Palette: %s",
-					info.fill_percent, info.rotation * 90,
-					table.concat(info.palette, ", "))
-			end
+		local pos = M.get_pointed_block(player)
+		if not pos then
+			return false, "Point at a chiseled block"
 		end
-		return false, "Not a chiseled block"
+		local info = M.get_block_info(pos)
+		if not info then
+			return false, "Point at a chiseled block"
+		end
+		return true, string.format(
+			"base=%s fill=%d/%d (%.1f%%) palette=%s stored=%d bytes",
+			info.base, info.solid_count, info.total_voxels, info.fill_percent,
+			table.concat(info.palette, ","), info.stored_bytes)
 	end,
 })
 
 core.register_chatcommand("mn_undo", {
 	params = "",
-	description = "Undo last micronode edit",
-	func = function(name, param)
+	description = "Undo your last micronode edit",
+	func = function(name)
+		local ok, blocks = M.undo(name)
+		if not ok then
+			return false, "Nothing to undo"
+		end
+		return true, "Restored " .. blocks .. " block(s)"
+	end,
+})
+
+core.register_chatcommand("mn_unchisel", {
+	params = "",
+	description = "Convert the chiseled block you are pointing at back to a plain node",
+	func = function(name)
 		local player = core.get_player_by_name(name)
 		if not player then
 			return false, "Player not found"
 		end
-		local pos = vector.subtract(player:get_pos(), vector.new(0, 1, 0))
-		pos = vector.round(pos)
-
-		if M.undo(pos) then
-			return true, "Undo successful"
+		local pos = M.get_pointed_block(player)
+		if not pos then
+			return false, "Point at a chiseled block"
 		end
-		return false, "Nothing to undo"
+		local base = M.unchisel(pos)
+		if not base then
+			return false, "Point at a chiseled block"
+		end
+		return true, "Converted back to " .. base
 	end,
 })
 
-------------------------------------------------------------------------------
--- Give chisel on join (for testing)
-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Session plumbing
+-------------------------------------------------------------------------------
 
 core.register_on_joinplayer(function(player)
 	local name = player:get_player_name()
 	get_state(name)
-
 	local inv = player:get_inventory()
-	if not inv:contains_item("main", "micronode_chisel:chisel") then
+	if inv and not inv:contains_item("main", "micronode_chisel:chisel") then
 		inv:add_item("main", "micronode_chisel:chisel")
-		core.chat_send_player(name,
-			"Micronode Chisel added! Left-click to chisel, right-click to edit.")
+		tell(name, "Chisel added. Left click a block to chisel it.")
 	end
 end)
 
 core.register_on_leaveplayer(function(player)
-	player_state[player:get_player_name()] = nil
+	local name = player:get_player_name()
+	state[name] = nil
+	M.forget_player(name)
 end)
 
 print("[micronode_chisel] Chisel tool loaded")

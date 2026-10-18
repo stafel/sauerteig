@@ -5,6 +5,14 @@
 **Location:** `luanti/games/devtest/mods/micronode_chisel/`
 **Flatpak Symlink:** `~/.var/app/org.luanti.luanti/.minetest/mods/micronode_chisel`
 
+> **Superseded (rendering/edit layer).** The numbers below still describe the
+> data model, but the rendering and edit layers were rewritten after the
+> in-game round showed disconnected faces instead of a continuous block: cube
+> entities were positioned at their min corner although the engine centers them.
+> The current architecture, engine facts and failure history live in
+> `docs/micronode-findings.md`; tests are `micronode_chisel/test.lua`
+> (in-engine) and `tools/headless_qc.py` (CI).
+
 ---
 
 ## Summary

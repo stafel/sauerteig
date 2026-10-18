@@ -1,54 +1,86 @@
--- Entity-based rendering for micronode blocks
+-- Render entity lifecycle for micronode blocks: one entity per merged face.
 --
--- WHY: Luanti node definitions (node_box etc.) are static per node TYPE and
--- synced to clients once at connect time. There is no per-instance node
--- geometry in the modding API, so a node_box set in metadata never shows.
+-- WHY ENTITIES: node definitions (node_box, tiles) are per node *type* and are
+-- pushed to clients at registration, so per-block-instance geometry cannot be
+-- a nodebox. A `visual = "cube"` entity can be scaled and textured per
+-- instance, so each merged face rectangle gets one entity.
 --
--- HOW: the container node is invisible (empty node_box) but keeps a full
--- selection box (pointing) and collision box (v1 simplified AABB). The
--- micronode geometry is rendered by one static entity per greedy-merged box,
--- scaled via visual_size and textured from the palette material.
--- Entities are static_save'd so they survive server restarts.
+-- ENTITY TRANSFORM (the rule that matters, verified against the engine):
+--   createCubeMesh() builds a cube spanning -0.5..+0.5 node and
+--   GenericCAO::addToScene() applies `setScale(visual_size)` to it, so a cube
+--   entity is CENTERED on the entity position and spans +-visual_size/2.
+-- Node positions are node centers too (the node at `pos` covers pos+-0.5).
+-- Therefore a box [x0..x1] in node-local space is spawned at
+--   pos + (x0+x1)/2  with  visual_size = x1-x0
+-- Spawning at the box's min corner instead displaces every face by
+-- (0.5 - size/2) per axis, which renders the block as scattered, disconnected
+-- faces. Do not "fix" this with a corner anchor.
+--
+-- Entities are not persisted (static_save = false). Engine behaviour
+-- (`ServerEnvironment::deactivateFarObjects`): a non-static object is kept
+-- while its mapblock is loaded in memory and is dropped when the block
+-- unloads. That lifetime is exactly what we want because render.lua re-derives
+-- every block's geometry from metadata on mapblock activation, so:
+--   * no stale geometry survives a code change or a restart, and
+--   * no per-block static object budget is consumed
+--     (`max_objects_per_block` counts static objects only).
 
 local M = micronode_chisel
 
--- Rendering budget: complex grids can produce hundreds of merged boxes.
--- Past this we fall back to one full-block box (still correct collision).
-M.MAX_RENDER_BOXES = 48
+M.ENTITY_NAME = "micronode_chisel:box"
+M.MAX_RENDER_BOXES = 96
 
-local ENTITY_NAME = "micronode_chisel:box"
+-- poskey -> {hash = string, objs = {ObjectRef}}
+local rendered = {}
 
-------------------------------------------------------------------------------
--- Entity definition
-------------------------------------------------------------------------------
+local function poskey(pos)
+	return pos.x .. "," .. pos.y .. "," .. pos.z
+end
 
-core.register_entity(ENTITY_NAME, {
+local function obj_alive(obj)
+	if not obj then
+		return false
+	end
+	local ok, lua = pcall(function()
+		return obj:get_luaentity()
+	end)
+	return ok and lua ~= nil
+end
+
+function M.render_budget()
+	local configured = core.settings and tonumber(core.settings:get("micronode_chisel.max_render_boxes"))
+	return configured or M.MAX_RENDER_BOXES
+end
+
+local PLACEHOLDER = {"blank.png", "blank.png", "blank.png",
+	"blank.png", "blank.png", "blank.png"}
+
+core.register_entity(M.ENTITY_NAME, {
 	initial_properties = {
 		physical = false,
 		collide_with_objects = false,
-		pointable = false,          -- raycast must hit the container node
+		pointable = false,        -- raycasts must hit the container node
 		visual = "cube",
 		visual_size = {x = 1, y = 1, z = 1},
-		textures = {
-			"default_stone.png", "default_stone.png", "default_stone.png",
-			"default_stone.png", "default_stone.png", "default_stone.png",
-		},
-		static_save = true,         -- persist with the mapblock
+		textures = PLACEHOLDER,
+		static_save = false,
 		shaded = true,
 	},
 
 	on_activate = function(self, staticdata)
-		if staticdata == "" or staticdata == nil then
+		if not staticdata or staticdata == "" then
 			self.object:remove()
 			return
 		end
 		local data = core.parse_json(staticdata)
-		if not data or not data.sx or not data.texs then
+		if type(data) ~= "table" or not data.sx or data.bx == nil then
+			-- Unreadable, or written by an older build whose transform math
+			-- was wrong: drop it, the LBM re-derives geometry from metadata.
 			self.object:remove()
 			return
 		end
-		self.block_pos = data.block_pos
-		self._staticdata = staticdata
+		self.block_pos = {x = data.bx, y = data.by, z = data.bz}
+		self.staticdata = staticdata
 		self.object:set_properties({
 			visual_size = {x = data.sx, y = data.sy, z = data.sz},
 			textures = data.texs,
@@ -56,20 +88,28 @@ core.register_entity(ENTITY_NAME, {
 	end,
 
 	get_staticdata = function(self)
-		return self._staticdata or ""
+		return self.staticdata or ""
 	end,
 })
 
-------------------------------------------------------------------------------
--- Entity management
-------------------------------------------------------------------------------
-
--- Remove all render entities belonging to the block at pos
+-- Remove every render entity belonging to the block at `pos`.
 function M.remove_block_entities(pos)
-	local center = vector.add(pos, vector.new(0.5, 0.5, 0.5))
-	for _, obj in ipairs(core.get_objects_inside_radius(center, 1.3)) do
+	local key = poskey(pos)
+	local entry = rendered[key]
+	if entry then
+		for _, obj in ipairs(entry.objs or {}) do
+			if obj_alive(obj) then
+				obj:remove()
+			end
+		end
+		rendered[key] = nil
+	end
+
+	-- Sweep as well: after a restart (or with entities left by an older build)
+	-- entities may exist that this process never registered.
+	for _, obj in ipairs(core.get_objects_inside_radius({x = pos.x, y = pos.y, z = pos.z}, 1.6)) do
 		local lua = obj:get_luaentity()
-		if lua and lua.name == ENTITY_NAME and lua.block_pos
+		if lua and lua.name == M.ENTITY_NAME and lua.block_pos
 			and lua.block_pos.x == pos.x and lua.block_pos.y == pos.y
 			and lua.block_pos.z == pos.z then
 			obj:remove()
@@ -77,183 +117,57 @@ function M.remove_block_entities(pos)
 	end
 end
 
--- Spawn one static entity per merged box
--- boxes: list from generate_optimized_nodeboxes (coords in -0.5..0.5)
--- Engine facts (visual = "cube"): visual_size is in node units and the cube
--- is centered on the entity position. Each face maps its whole texture, so
--- textures must be cropped to the box's proportional region of the base
--- texture (like nodebox UV mapping does) to avoid stretching/warping.
--- Whether the Luanti nodes adjacent to the block are walkable; faces
--- against solid neighbors are never visible and can be culled.
--- Returns a table of {px, nx, py, ny, pz, nz} = true when that side is
--- OPEN (neighbor not walkable).
-local function solid_outside_sides(pos)
-	local sides = {}
-	local defs = {
-		px = { 1, 0, 0}, nx = {-1, 0, 0},
-		py = { 0, 1, 0}, ny = { 0,-1, 0},
-		pz = { 0, 0, 1}, nz = { 0, 0,-1},
-	}
-	for key, d in pairs(defs) do
-		local npos = vector.add(pos, vector.new(d[1], d[2], d[3]))
-		local ndef = core.registered_nodes[core.get_node(npos).name]
-		sides[key] = not (ndef and ndef.walkable)
+function M.forget_block(pos)
+	rendered[poskey(pos)] = nil
+end
+
+-- True when the block already renders exactly these boxes and the entities are
+-- still alive (used to skip re-spawning on every edit).
+function M.is_current(pos, hash)
+	local entry = rendered[poskey(pos)]
+	if not entry or entry.hash ~= hash then
+		return false
 	end
-	return sides
+	for _, obj in ipairs(entry.objs or {}) do
+		if not obj_alive(obj) then
+			return false
+		end
+	end
+	return true
 end
 
-local function crop_16(tex, u0, v0, u1, v1)
-	-- Normalize to 16px so the crop is texture-pack agnostic
-	local base = tex .. "^[resize:16x16"
-	-- face boxes may have reversed extents (inward depth): normalize the
-	-- region, else the blit lands outside the canvas and the face goes
-	-- fully transparent (invisible)
-	if u1 < u0 then u0, u1 = u1, u0 end
-	if v1 < v0 then v0, v1 = v1, v0 end
-	local x = math.floor(math.max(0, math.min(1, u0)) * 16 + 0.5)
-	local y = math.floor(math.max(0, math.min(1, v0)) * 16 + 0.5)
-	local w = math.max(1, math.floor(math.max(0, math.min(1, u1)) * 16 + 0.5) - x)
-	local h = math.max(1, math.floor(math.max(0, math.min(1, v1)) * 16 + 0.5) - y)
-	local escaped = base:gsub("([%^:])", "\\%1")
-		-- [combine:WxH:x,y=tex blits tex at (x,y) ONTO the WxH canvas:
-	-- cropping therefore uses negative offsets so the wanted region
-	-- lands inside the canvas (see texture-modifier docs).
-	return string.format("[combine:%dx%d:%d,%d=%s", w, h, -x, -y, escaped)
+function M.remember(pos, hash, objs)
+	local key = poskey(pos)
+	if #objs == 0 then
+		rendered[key] = nil
+	else
+		rendered[key] = {hash = hash, objs = objs}
+	end
 end
 
-local function face_textures(tex, box)
-	local tx0, tx1 = box.x0 + 0.5, box.x1 + 0.5
-	local ty0, ty1 = box.y0 + 0.5, box.y1 + 0.5
-	local tz0, tz1 = box.z0 + 0.5, box.z1 + 0.5
-	-- Nodebox-style UV regions, texture order: +Y, -Y, +X, -X, +Z, -Z
-	return {
-		crop_16(tex, tx0, 1 - tz1, tx1, 1 - tz0),
-		crop_16(tex, tx0, tz0, tx1, tz1),
-		crop_16(tex, tz0, 1 - ty1, tz1, 1 - ty0),
-		crop_16(tex, 1 - tz1, 1 - ty1, 1 - tz0, 1 - ty0),
-		crop_16(tex, 1 - tx1, 1 - ty1, 1 - tx0, 1 - ty0),
-		crop_16(tex, tx0, 1 - ty1, tx1, 1 - ty0),
-	}
-end
-
-local FACE_EPSILON = 1 / 64
-
-local function spawn_box(pos, box, texture)
-	-- extents may be reversed (inward-deep faces); normalize to min/max
+-- Spawn one entity for a face box. World position and size follow the
+-- centered-cube rule documented at the top of this file.
+function M.spawn_box(pos, box, textures)
 	local x0, x1 = math.min(box.x0, box.x1), math.max(box.x0, box.x1)
 	local y0, y1 = math.min(box.y0, box.y1), math.max(box.y0, box.y1)
 	local z0, z1 = math.min(box.z0, box.z1), math.max(box.z0, box.z1)
-	local sx = math.max(x1 - x0, FACE_EPSILON)
-	local sy = math.max(y1 - y0, FACE_EPSILON)
-	local sz = math.max(z1 - z0, FACE_EPSILON)
-	-- Anchor calibration: the cube visual's anchor point. "corner" places the
-	-- entity at the box's min corner and the cube extends +size from it
-	-- (matches observed 5.17.0 rendering); "center" places it at the box
-	-- center with +/- size/2 extent. Configurable in case other builds
-	-- anchor differently.
-	local anchor = core.settings and core.settings:get("micronode_chisel.anchor") or "corner"
-	local origin
-	if anchor == "center" then
-		origin = vector.add(pos, vector.new(
-			(x0 + x1) / 2 + 0.5,
-			(y0 + y1) / 2 + 0.5,
-			(z0 + z1) / 2 + 0.5))
-	else
-		origin = vector.add(pos, vector.new(x0 + 0.5, y0 + 0.5, z0 + 0.5))
+
+	local sx, sy, sz = x1 - x0, y1 - y0, z1 - z0
+	if sx <= 0 or sy <= 0 or sz <= 0 then
+		return nil
 	end
+
+	local origin = {
+		x = pos.x + (x0 + x1) / 2,
+		y = pos.y + (y0 + y1) / 2,
+		z = pos.z + (z0 + z1) / 2,
+	}
 	local data = core.write_json({
-		block_pos = {x = pos.x, y = pos.y, z = pos.z},
-		sx = sx,
-		sy = sy,
-		sz = sz,
-		texs = face_textures(texture, box),
+		bx = pos.x, by = pos.y, bz = pos.z,
+		sx = sx, sy = sy, sz = sz,
+		texs = textures,
 	})
-	core.add_entity(origin, ENTITY_NAME, data)
+	return core.add_entity(origin, M.ENTITY_NAME, data)
 end
 
-------------------------------------------------------------------------------
--- Visual refresh (overrides the placeholder in chisel.lua)
-------------------------------------------------------------------------------
-
--- Rebuild the visible geometry of a chiseled block from its metadata
-function M.update_block_mesh(pos)
-	local meta = core.get_meta(pos)
-	local data_str = meta:get_string(M.META_KEY_DATA)
-	if data_str == "" then return end
-
-	local block_data = M.deserialize_block_data({
-		data = data_str,
-		palette = meta:get_string(M.META_KEY_PALETTE),
-		rotation = meta:get_string(M.META_KEY_ROTATION),
-		base = meta:get_string(M.META_KEY_BASE),
-	})
-
-	local node = core.get_node(pos)
-
-	-- Fully carved back out? Return to the base material (metadata is
-	-- preserved by swap_node, so it stays a chiseled block underneath).
-	if M.is_empty(block_data.grid) then
-		M.remove_block_entities(pos)
-		return
-	end
-
-	-- Fully solid? Swap back to the base node for cheap native rendering.
-	if M.is_full(block_data.grid) then
-		M.remove_block_entities(pos)
-		if node.name ~= block_data.base and core.registered_nodes[block_data.base] then
-			core.swap_node(pos, {name = block_data.base})
-		end
-		return
-	end
-
-	-- Partial: make sure the container node is in place, then render boxes
-	if node.name ~= "micronode_chisel:chiseled_block" then
-		core.swap_node(pos, {name = "micronode_chisel:chiseled_block"})
-	end
-
-	M.remove_block_entities(pos)
-
-	local sides = solid_outside_sides(pos)
-
-	-- Progressive coarsening: try full resolution first; if the merged
-	-- surface needs more entities than the render budget allows, re-mesh
-	-- with coarser (uniformly filled) voxel blocks so the shape stays
-	-- recognizable instead of snapping back to a full block.
-	for _, step in ipairs({1, 2, 4, 8, 16}) do
-		local grid, res = block_data.grid, M.RESOLUTION
-		if step > 1 then
-			grid, res = M.coarsen_grid(block_data.grid, step)
-		end
-		local boxes = M.generate_surface_faces(grid, block_data.palette, sides, res)
-		if #boxes == 0 then
-			return
-		end
-		if #boxes <= M.MAX_RENDER_BOXES or step == 16 then
-			if step > 1 then
-				core.log("action", "[micronode_chisel] " .. core.pos_to_string(pos)
-					.. ": rendering at 1/" .. step .. " resolution ("
-					.. #boxes .. " faces)")
-			end
-			for _, box in ipairs(boxes) do
-				spawn_box(pos, box, M.get_texture(box.material))
-			end
-			return
-		end
-	end
-end
-
-print("[micronode_chisel] Entity rendering loaded")
-
-------------------------------------------------------------------------------
--- Rebuild meshes on load
-------------------------------------------------------------------------------
-
-core.register_lbm({
-	name = "micronode_chisel:rebuild_meshes",
-	label = "Rebuild micronode render entities",
-	nodenames = {"micronode_chisel:chiseled_block"},
-	run_at_every_load = true,
-	action = function(pos)
-		M.update_block_mesh(pos)
-	end,
-})
+print("[micronode_chisel] Entity layer loaded")

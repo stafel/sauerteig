@@ -1,130 +1,181 @@
 # Micronode Chisel — Engineering Findings
 
-Accumulated findings from the micronode_chisel development rounds (2026-10-18).
-Read this before touching the renderer, picker, or entity code.
+Read this before touching the renderer, picker, or entity code. Everything in
+§1 and §3 is ground truth taken from the engine sources in this repository
+(`luanti/src/...`), not from observation.
 
 ---
 
-## 1. Luanti 5.17.0 entity engine semantics (empirically verified)
+## 1. Entity visuals: the cube is CENTERED on the entity position
 
-### Cube entity visual (`visual = "cube"`)
+Verified in `luanti/src/client/`:
 
-- `visual_size` is in **node units** (NOT the 0.1-node scale used for
-  `visual = "mesh"` models; do not multiply by 10).
-- **The anchor point is the min corner**: the rendered cube extends
-  **+size** from the entity position (observed behavior on 5.17.0).
-  The engine source (`createCubeMesh` + `setScale`) reads as if the cube
-  were centered, but three independent in-game observations proved the
-  effective anchor is the corner:
-  1. Full 1×1×1 box spawned at box-center → rendered +0.5 in every axis.
-  2. Thin (1/16) carve walls nearly correct while a 1×1 top face was
-     offset +0.5 → shift = +size/2, i.e. corner anchor.
-  3. After surface meshing, every face displaced by half its extent.
-  A center-anchored client would have shown zero offset in all three.
-- Consequence in `spawn_box` (entities.lua): entity position must be
-  `pos + (box.x0 + 0.5, box.y0 + 0.5, box.z0 + 0.5)` — the box's min
-  corner in world space.
-- Calibration valve: setting `micronode_chisel.anchor`
-  (`"corner"` default, `"center"` alternative) recalibrates without a
-  code change if a future engine build anchors differently.
-- Each face of a cube visual maps its **whole texture** onto that face
-  regardless of box size → textures must be cropped per face with
-  `[combine` (see §3 texture crops).
+| File | What it shows |
+|---|---|
+| `mesh.cpp:43` `createCubeMesh(scale)` | Vertices span **-0.5 .. +0.5**, then `scaleMesh(mesh, v3f(BS,BS,BS))` (BS = 10 = 1 node) |
+| `content_cao.cpp:683` (`OBJECTVISUAL_CUBE`) | `m_meshnode->setScale(m_prop.visual_size)` — a scale about the node origin |
+| `content_cao.cpp:972` `updateNodePos()` | The parent matrix node is translated to the entity position; the mesh node is a child at the origin |
 
-### `visual = "node"` exists (5.12+) but was not used
-It renders exactly one node type — not usable for arbitrary chiseled
-geometry. Cube visuals + per-face crops is the current approach.
+So a `visual = "cube"` entity spans **pos ± visual_size/2**: it is centered,
+exactly like a node (the node at `pos` covers `pos ± 0.5`).
 
-### Entities and persistence
+**Consequence for face boxes** (`entities.lua: M.spawn_box`):
 
-- `static_save = true` entities are persisted in the map; buggy render
-  entities from old code **survive code fixes** and reappear every load.
-  Render entities now use `static_save = false`; an LBM
-  (`micronode_chisel:rebuild_meshes`, `run_at_every_load = true`)
-  re-meshes from metadata on every mapblock activation.
-- Legacy entity cleanup: `on_activate` removes any entity whose
-  staticdata lacks the current format field (`texs`); removal radius
-  widened to 8 nodes.
+```lua
+origin     = pos + (x0 + x1) / 2      -- box CENTER, not the min corner
+visual_size = {x1 - x0, y1 - y0, z1 - z0}
+```
 
-### Raycast / pointed_thing
+**This is the bug that shipped three times.** The earlier implementation
+spawned each face at the box's min corner (`pos + x0 + 0.5`), which displaces
+every face by `0.5 - size/2` per axis. Full-size faces land correctly by
+coincidence while small faces fly off by up to half a node — the block then
+renders as disconnected, scattered faces instead of one solid. §5 has the
+history. Do **not** reintroduce a "corner anchor" mode; the misdiagnosis was
+caused by treating the integer node position as the node's *min corner*
+(it is the *center*).
 
-- `pointed_thing.above/under` carry only **integer node positions**;
-  they cannot locate a micronode. Precise hits require either
-  `core.raycast` (gives `intersection_point`) or — the final solution —
-  a voxel DDA march through the block's own grid (see §4).
-- Player eye height used: `player:get_pos() + (0, 1.475, 0)`.
+Also note:
+
+- `visual_size` for `visual = "cube"` is in **node units** (not the 0.1-node
+  scale used by `visual = "mesh"` models).
+- A cube face maps its **whole texture** onto that face, so per-face texturing
+  requires cropping (§3).
+- `visual = "node"` (5.12+) exists but renders exactly one node type, so it
+  cannot express per-instance chiseled geometry.
+- Entity `static_save` is `false` here: render entities are derived data.
+  `ServerEnvironment::deactivateFarObjects` keeps a **non-static** object alive
+  while its mapblock is loaded in memory and drops it when the block unloads —
+  exactly the lifetime we want, because `micronode_chisel:rebuild_meshes`
+  (`run_at_every_load = true`) re-derives the geometry from metadata on every
+  mapblock activation. Consequences: nothing stale survives a restart or a code
+  change, and the per-block static object budget (`max_objects_per_block`,
+  minimum 256) is not consumed. Persisting them (`static_save = true`) would
+  both fight the LBM and risk that budget in a densely chiselled mapblock.
 
 ---
 
 ## 2. Architecture (Cube 2 / Sauerbraten model)
 
-Research sources: `docs/spike-results/sauerbraten-spike.md`,
-https://github.com/embeddedc/sauerbraten (engine/octa*.cpp).
-Sauerbraten's editing quality comes from three properties we replicate:
+Sauerbraten's editing feel comes from three properties, replicated here:
 
-1. **Surface-only rendering**: only faces where solid borders air are
-   emitted; faces are greedily merged into maximal coplanar rectangles
-   per slice/material. No interior geometry, no overlapping solid boxes,
-   no z-fighting. (`M.generate_surface_faces`, render.lua)
-2. **Exact picking**: a DDA march of the look ray through the voxel grid
+1. **Surface-only rendering.** Only faces where solid borders air exist, and
+   coplanar same-material faces are greedily merged into maximal rectangles per
+   slice (`mesh.lua: M.build_surface_boxes`). No interior geometry, no
+   overlapping solid boxes, no z-fighting inside the shape.
+2. **Exact picking.** A voxel DDA march (Amanatides & Woo) along the look ray
    finds the first solid micronode and its entry-face normal
-   (`pick_micronode`, chisel.lua). Remove carves the hit voxel; add
-   grows on the air side of the hit face (Sauerbraten `mpeditface`
-   semantics).
-3. **Instant local feedback**: edits apply to grid + metadata, then
-   re-mesh; no geometry data crosses the network.
+   (`edit.lua: M.raycast_grid`). Pull carves inward from that face, push adds a
+   layer on the air side.
+3. **Grid-snapped edits.** The brush is snapped to the active grid step
+   (1, 2, 4, 8, 16 micronodes) around the hit cell
+   (`edit.lua: M.push_brush` / `M.pull_brush`) — Sauerbraten's `gridpower`.
 
-### Grid indexing gotcha (bit us once)
+### Modules
 
-`M.get_voxel` hardcodes the 16³ stride
-`(z-1)*16*16 + (y-1)*16 + x` (1-based, +x — correct for full-res grids).
-Coarse grids (see below) have a **different stride**. The mesher must
-use its own resolution-local accessor (`voxel()` inside
-`generate_surface_faces`), not `M.get_voxel`.
+| File | Responsibility |
+|---|---|
+| `data.lua` | 16³ grid, palette, versioned RLE storage, transforms, textures |
+| `collision.lua` | solid vs walk-through container variant, fill ratio |
+| `mesh.lua` | exposed-surface extraction, greedy merging, box hash |
+| `edit.lua` | block access, DDA picking, brushes, region application, undo |
+| `entities.lua` | render entity lifecycle (cube visual, centered transform) |
+| `render.lua` | face texture crops, per-block rebuild, mapblock LBM |
+| `chisel.lua` | container nodes, chisel tool, chat commands |
+| `api.lua` | public API for other mods |
 
-Also: `M.count_solid` must be **nil-safe** (`grid[i] ~= 0` is TRUE for
-nil entries — coarse grids are shorter than 4096 and miscounted).
+### Coordinate spaces
 
-### Progressive coarsening (render budget)
+- **block-local**: 1-based cell index `1..RESOLUTION` — the storage layout,
+  `index = (z-1)*res*res + (y-1)*res + x`.
+- **absolute**: 0-based micronode offset relative to a target block
+  (`0..RESOLUTION-1` is that block). Brushes are built in this space and
+  `edit.lua: split_region` splits a brush across node boundaries, so a push
+  that crosses a border creates/fills the neighbouring chiseled block instead
+  of stopping dead at it.
+- **node-local render space**: `-0.5 .. 0.5`, what the mesher emits and what
+  `spawn_box` consumes.
 
-`M.MAX_RENDER_BOXES = 48` entities per block. When the full-res surface
-exceeds it, `update_block_mesh` re-meshes from `M.coarsen_grid(grid,
-step)` at step = 2, 4, 8, 16 (majority-fill downsampling). The coarse
-grid has resolution `oR = ceil(16/step)` and is laid out with oR³
-stride; `coarsen_grid` returns `(grid, oR)` and the mesher receives `oR`
-as its `res` parameter. **Never** fall back to a full-block box — that
-was the "node refills at ~12% chiseled" bug (any carve exceeding 48
-rects snapped the block back to solid).
-
----
-
-## 3. Texture crops
-
-Per-face textures are produced in `entities.lua`:
-
-- Normalize first: `tex .. "^[resize:16x16"` (texture-pack agnostic).
-- Crop with `[combine:WxH:-x,-y=<escaped>` — **negative** blit offsets.
-  `[combine` blits at (x,y) ONTO the canvas; positive offsets place the
-  texture outside the canvas → fully transparent face ("open sides"
-  bug). Escaping: `base:gsub("([%^:])", "\\%1")`.
-- UV regions follow nodebox conventions (match
-  `convertNodeboxesToMesh` in engine `mesh.cpp`); texture order:
-  +Y, -Y, +X, -X, +Z, -Z.
+Grid indexing is the other classic trap: `M.get_voxel`/`M.set_voxel` take an
+explicit `res` and the mesher/boundary masks pass theirs. A coarsened grid has
+a different stride, and `M.count_solid` is nil-safe because short grids have
+nil cells that `v ~= 0` would count as solid.
 
 ---
 
-## 4. Voxel DDA picking (Amanatides–Woo)
+## 3. Rendering rules
 
-`pick_micronode(pos, player, grid)` in chisel.lua:
+### Face slabs, not paper-thin quads
 
-- Ray origin: eye, block-relative, scaled to voxel units (`× R`).
-- Voxel i covers `[(i-1)/R, i/R)` — 1-based indices.
-- Boundary distance: `(boundary - o[axis]) / d[axis]` where boundary is
-  `c` when stepping positive and `c - 1` when negative. Zero-direction
-  components use `math.huge` (early-out `t[axis] > 512`).
-- Returns hit voxel + entry-face unit normal (air side).
-- Verified scenarios: top-center look on full block → (9,16,9)/+y;
-  half-slab top → y=8/+y; side look → x=16/+x; empty grid → nil.
+Each merged face is emitted as a slab whose **outward plane is exactly on the
+voxel boundary** and which extends `FACE_DEPTH_FRACTION` (1/4) of a micronode
+into the solid. That keeps the box non-degenerate and makes neighbouring faces
+interpenetrate slightly at shared edges.
+
+Depth must stay well below one micronode: at a full-voxel depth, a one-voxel
+thick feature (a shelf, a wall) produces two boxes whose *inner* planes
+coincide exactly, which z-fights. Surface planes are always ≥ 1/RESOLUTION
+apart, so a quarter-voxel depth can never coincide with another surface.
+
+Seams between perpendicular faces are *not* what the extrusion fixes — exact
+math already makes the faces share edges. The historical "split up parts" look
+was the transform bug of §1.
+
+### Neighbour culling
+
+Faces on a node boundary are dropped when the adjacent node is a full solid
+cube, and **per cell** when the adjacent node is a chiseled block that has solid
+cells touching that face (`edit.lua: M.build_neighbors`,
+`boundary_mask`). Per-cell culling is required: without it two adjacent
+chiseled blocks emit coincident faces along their shared boundary.
+
+Face-plane coordinates are shared between neighbours:
+
+```
+axis 1 (x faces): u = y, v = z
+axis 2 (y faces): u = x, v = z
+axis 3 (z faces): u = x, v = y
+```
+
+Unloaded ("ignore") neighbours are treated as **open**, so a block never shows
+a hole while the neighbouring mapblock is not loaded.
+
+### Texture crops
+
+A cube face maps its whole texture, so each face gets a crop of the material
+texture (`render.lua: M.crop_texture`), which makes the pattern line up across
+faces and across blocks (Sauerbraten-style world-aligned texturing):
+
+- normalize first: `tex .. "^[resize:16x16"` (texture-pack agnostic);
+- crop with `[combine:WxH:-x,-y=<escaped>` — **negative** blit offsets.
+  `[combine` blits at (x,y) *onto* the canvas, so positive offsets land outside
+  it and the face becomes fully transparent ("invisible block" bug);
+- escape `^` and `:` in the inner texture (`base:gsub("([%^:])", "\\%1")`);
+- UV regions follow `createCubeMesh`'s per-face UV winding; texture/tile order
+  is **+Y, -Y, +X, -X, +Z, -Z**.
+
+Only the outward face of a slab is ever visible, so the same crop is reused for
+all six cube faces (cheaper texture strings, no media cost — modifiers are
+resolved client-side).
+
+---
+
+## 4. Voxel DDA picking
+
+`edit.lua: M.raycast_grid(grid, pos, origin, dir, res)`:
+
+- Ray origin is the player eye (`get_pos()` = feet, plus `eye_height`);
+- the ray is transformed into block-local voxel units, `0..res` per axis;
+- a slab test clips it to the node's AABB, giving `t_enter`, `t_exit` and the
+  entry face (used as the first cell's normal);
+- Amanatides & Woo marching thereafter; each step's normal is `-step`, i.e. it
+  points at the air side of the hit face;
+- if the ray starts inside the block, no entry face exists and the normal is
+  zero (push then refuses, pull carves the hit cell).
+
+Verified scenarios: straight down on a full block → top cell, `+y`; from -x on
+a full block → cell 1, `-x`; half slab → top cell of the slab, `+y`; carved
+half → the remaining slab's face; empty grid → nil.
 
 ---
 
@@ -132,73 +183,51 @@ Per-face textures are produced in `entities.lua`:
 
 | Symptom | Root cause |
 |---|---|
-| Progress % wrong / hits not where clicked | Picking used `pointed_thing.above` integer math with unclamped per-face formulas |
-| Geometry half-node offset (3 rounds) | Wrong cube-visual anchor assumption (center vs corner, §1) |
-| Textures stretched/warped | Cube visual maps whole texture per face; no crop (§3) |
-| Open sides (invisible faces) | `[combine` blit offsets positive instead of negative |
-| Node "refills" at ~12% chiseled | Render-budget fallback spawned one full-block box |
-| Block completely invisible | crop_16 got reversed face extents (from inward depth): u0>u1 → blit outside canvas → transparent faces. crop must normalize the region first |
-| Block rendered as "split up parts" with seams | Face quads were paper-thin; faces only met edge-to-edge (no volume overlap) |
-| Rest of node invisible + floating top | Mesher read coarse grid with 16³ stride (§2 gotcha) |
-| Startup crash ×3 (`solid_outside_sides`, `block_grid`, `voxel` nil) | Multi-step patch scripts: a later step's `assert` failure rolled back part of an edit while another step's changes had already landed |
-| Spawned stone block kills player | `test_entity_rendering` placed a node at (0,40,0) — the spawn column — on every world start |
-
-### Face depth (split-part bug)
-
-Paper-thin (1/64) face quads only touch at their edges → the block
-read as "split up parts" with visible seams at every corner. Each face
-box now extends **one full voxel (1/R) INTO the solid**, so adjoining
-faces/quads overlap inside the shape and it reads as one continuous
-solid; the outward surface planes stay exact. Consequence: face boxes
-can have **reversed extents** (e.g. x: 0.5 → 0.4375); `spawn_box`
-normalizes min/max before computing size and origin.
-
-### Crop normalization (invisible-block bug)
-
-Inward face depth means face boxes can have reversed extents; BOTH
-consumers must normalize: `spawn_box` (min/max before size+origin) and
-`crop_16` (u/v region before pixel math). Missing the second made every
-face texture a blit landing fully outside its canvas → invisible block.
-The QC entity audit now catches this class end-to-end.
-
-**Process lesson**: every shipped crash class (orphaned reference) came
-from scripted multi-block edits. Rules:
-
-1. Never script a multi-part edit where one part can fail after another
-   has been written. Apply the whole edit atomically or verify
-   afterwards with the QC harness before committing.
-2. Always run `python3 tools/headless_qc.py` before pushing. Its
-   strict-globals check would have caught all three orphaned-reference
-   crashes.
-3. CI (`.github/workflows/qc.yml`) runs syntax + headless QC on every
-   push; keep it green.
+| **Block renders as disconnected, scattered faces** (three rounds) | Face entities spawned at the box's min corner although cube visuals are centered (§1). Each face displaced by `0.5 - size/2` |
+| "Everything is half a node off" | Same root cause, opposite compensation: entity placed at `pos + center + 0.5` (treating `node pos` as the min corner) |
+| Textures stretched/warped | Cube visual maps the whole texture per face; no crop (§3) |
+| Open sides / invisible block | `[combine` blit offsets positive instead of negative, or a reversed extent making the region land outside the canvas |
+| Node "refills" at ~12% chiseled | Render-budget fallback spawned one full-block box. The fallback now re-meshes a conservative downsample, never a hull |
+| Block rendered as "split up parts" | Paper-thin quads *plus* the transform bug: the displacement was read as a seam problem and "fixed" by extruding a full voxel, which reintroduced z-fighting on thin features (§3) |
+| Rest of node invisible + floating top | Coarse grid read with the 16³ stride (§2) |
+| Startup crash ×3 (`solid_outside_sides`, `block_grid`, `voxel` nil) | Multi-step patch scripts: a later step failed after earlier steps had landed, leaving orphaned references |
+| Spawned stone block kills player | `test_entity_rendering` placed a node in the spawn column on every world start |
+| Edits that silently did nothing | Brush material index written into the grid without registering it in the block palette; palette entries were never compacted, so the 4 slots filled with dead materials |
+| Crash `mesh.lua: attempt to compare number with nil` on any non-full block | The per-slice face mask is **sparse** (only exposed cells are stored), so `mask[...]` is `nil` for unexposed cells. `mat > 0` then compares nil. A fully solid block has a dense mask, which is why only slabs/carves crashed. Read masks as `mask[...] or 0` |
+| A crash in one self-test hid all later ones | The suites ran unwrapped in a single `core.after` callback, so the first error aborted the run. Each suite is now `pcall`ed and reported individually |
+| Process lesson | Never script a multi-part edit where one part can fail after another part was written. Run `python3 tools/headless_qc.py` before pushing — its strict-globals pass catches orphaned references, its render audit catches transform and crop regressions |
 
 ---
 
-## 6. QC infrastructure
+## 6. Testing and QC
 
-- `tools/stub.lua` — minimal headless `core`/`vector` stubs.
-- `tools/headless_qc.py` (needs `pip install lupa`, real Lua 5.5):
-  - loads all six mod files with stubs,
-  - **strict globals**: every file executed under a `_G` metatable that
-    raises on undefined global reads — catches orphaned references at
-    load time,
-  - functional checks against the real Lua code: full block → 6 faces
-    in bounds; empty → 0; half slab → 6 faces with merged top at y=0;
-    corner carve → 12 faces; coarse path spans full node; coarsen of
-    full stays full; serialization round-trip preserves 4096 voxels;
-    spawn-origin check (corner anchor places box exactly in region).
-- Python ports of mesher/DDA (used during development to verify logic
-  before committing Lua) are in the session history; prefer extending
-  the lupa harness since it exercises the actual Lua code.
+- `micronode_chisel/test.lua` — in-engine self tests, run ~2 s after server
+  start (`micronode_chisel.tests = false` disables). Covers data, storage,
+  palette, transforms, meshing, picking, brushes, editing/undo integration, the
+  entity transform (entity positions must equal box centers) and benchmarks.
+- `tools/stub.lua` — headless engine stub: node store, metadata store, entity
+  store with ObjectRef-ish objects, JSON passthrough.
+- `tools/qc_checks.lua` + `tools/headless_qc.py` — runs the real mod Lua against
+  the stub in CI, including:
+  - storage round trips and the 1 byte/cell size bound,
+  - mesher invariants (count, bounds, outward planes, one thin axis, per-cell
+    neighbour culling, material splits, hash sensitivity),
+  - render-budget coarsening,
+  - DDA picking and brush regions,
+  - the **render audit**: chisel → carve → re-mesh, then verify every entity
+    sits at its box center with the exact box size, inside the node, with
+    parseable `[combine` crops,
+  - a strict `_G` pass that raises on undefined global reads.
 
-## 7. Known open items / v2 candidates
+---
 
-- Collision is v1 full-block AABB (`collision.lua`); per-micronode
-  collision is the planned v2 (`get_detailed_collision_boxes` exists
-  as a stub).
-- `MAX_RENDER_BOXES = 48` is per-block; watch entity counts if
-  raising.
-- The `micronode_chisel.anchor` setting defaults to `corner`; if a
-  future engine release changes cube anchoring, recalibrate via
-  minetest.conf instead of code.
+## 7. Known limitations (v1)
+
+| Limitation | Impact | Path forward |
+|---|---|---|
+| Collision is per block, not per cell | A block below 50 % solid becomes walk-through, above it collides as a full cube | Engine support for per-node collision boxes, or invisible physical entities |
+| Lighting is per node | A carved cavity still occludes sunlight as if solid | Engine micronode lighting (Phase 3 in `docs/subnode-editing-plan.md`) |
+| One entity per merged face | A chaotic carve can reach the budget (`micronode_chisel.max_render_boxes`, default 96) and then renders at a conservative downsample | Engine-side per-block mesh |
+| 4 materials per block | Pushing a 5th material is refused with a message | Palette per face, or engine support |
+| Editing crosses node borders by creating neighbours | Pushing into a solid non-chiseled node does not convert it (it stops at the boundary) | Convert-on-push, needs a "was converted" marker for undo |
+| `swap_node` keeps metadata | A container node replaced by `/setnode` with leftover metadata is re-initialised empty | — |
